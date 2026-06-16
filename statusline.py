@@ -73,9 +73,13 @@ def render(data):
 
     cost = (data.get("cost") or {}).get("total_cost_usd") or 0
     duration = (data.get("cost") or {}).get("total_duration_ms") or 0
+    effort = (data.get("effort") or {}).get("level")
 
     # Line 1
-    line1 = f"{CYAN}[{model} · {window}]{RESET}"
+    head = f"{model} ({window})"
+    if effort:
+        head += f" · {effort}"
+    line1 = f"{CYAN}[{head}]{RESET}"
     line1 += f"  {FOLDER} {folder}"
     branch = git_segment(cwd)
     if branch:

@@ -83,6 +83,7 @@ class TestRender(unittest.TestCase):
                 "total_input_tokens": 187000,
             },
             "cost": {"total_cost_usd": 0.08, "total_duration_ms": 423000},
+            "effort": {"level": "high"},
         }
         base["context_window"].update(ctx)
         return base
@@ -96,6 +97,18 @@ class TestRender(unittest.TestCase):
         self.assertIn("Opus 4.8", line1)
         self.assertIn("1M", line1)
         self.assertIn("ContextPlugin", line1)
+
+    def test_line1_format_model_window_effort(self):
+        line1 = s.render(self._data()).split("\n")[0]
+        self.assertIn("Opus 4.8 (1M) · high", line1)
+
+    def test_line1_no_effort_segment_when_absent(self):
+        d = self._data()
+        d.pop("effort", None)
+        line1 = s.render(d).split("\n")[0]
+        self.assertIn("Opus 4.8 (1M)", line1)
+        # no trailing " · effort" after the window
+        self.assertNotIn("·", line1.split("(1M)")[1])
 
     def test_line2_has_pct_tokens_cost_time(self):
         line2 = s.render(self._data()).split("\n")[1]

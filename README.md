@@ -3,11 +3,11 @@
 A two-line [Claude Code](https://code.claude.com) status line: a **battery bar of free context** plus the **occupied context in tokens**, color-coded by absolute thresholds. Nerd Font glyphs, no external dependencies (Python 3 stdlib only — no `jq`).
 
 ```
-[Opus 4.8 · 1M]   ContextPlugin  │   feature/auth
+[Opus 4.8 (1M) · high]   ContextPlugin  │   feature/auth
 ▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08  │   7m 3s
 ```
 
-**Line 1** — model + context window size, current folder (real basename), and git branch (only inside a repo; `*` when dirty).
+**Line 1** — model + context window size + reasoning effort (`effort.level`; omitted when the model doesn't support it), current folder (real basename), and git branch (only inside a repo; `*` when dirty).
 
 **Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), session cost, and session duration.
 
