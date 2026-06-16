@@ -31,11 +31,12 @@ The battery bar and the token number share one color, driven by occupied tokens:
    ```json
    "statusLine": {
      "type": "command",
-     "command": "python3 ~/.claude/statusline.py"
+     "command": "python3 ~/.claude/statusline.py",
+     "refreshInterval": 30
    }
    ```
 
-The bar updates on the next render tick.
+The bar updates on Claude Code events (new assistant message, `/compact`, permission/vim mode changes; debounced at 300ms). Those triggers go quiet while the session is idle, so the time-based segments (session duration, cost) would otherwise freeze. `refreshInterval` re-runs the script on a fixed timer to keep them live — `30` (seconds) is a light default; the minimum is `1`. Drop the field to run on events only.
 
 ### Requirements
 - Python 3 (stdlib only)
