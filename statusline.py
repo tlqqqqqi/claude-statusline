@@ -169,7 +169,7 @@ def save_state(path, state):
         with os.fdopen(fd, "w") as f:
             json.dump(state, f)
         os.replace(tmp, path)
-    except OSError:
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:
