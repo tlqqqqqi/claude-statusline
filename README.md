@@ -27,7 +27,7 @@ The battery bar and the token number share one color, driven by occupied tokens:
 machine for the current local day. Claude Code's status line input only
 reports the *current* session's cost, so the script aggregates it itself:
 each render upserts the session's cost into a small state file
-(`$CLAUDE_CONFIG_DIR/statusline_cost.json`, default `~/.claude/`), keyed by
+(`$CLAUDE_CONFIG_DIR/statusline_cost.json`, default `~/.claude/statusline_cost.json`), keyed by
 `session_id` and stamped with the local date. Entries from previous days are
 pruned automatically, which also resets the total at local midnight.
 

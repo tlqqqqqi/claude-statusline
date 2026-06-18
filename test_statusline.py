@@ -217,7 +217,16 @@ class TestDailyTotalFor(unittest.TestCase):
         os.environ["CLAUDE_CONFIG_DIR"] = d
 
     def test_none_without_session_id(self):
-        self.assertIsNone(s.daily_total_for({"cost": {"total_cost_usd": 1.0}}))
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            self._isolated_env(d)
+            try:
+                self.assertIsNone(s.daily_total_for({"cost": {"total_cost_usd": 1.0}}))
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
 
     def test_records_and_returns_total(self):
         from datetime import datetime
