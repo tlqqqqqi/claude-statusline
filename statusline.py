@@ -3,6 +3,9 @@
 
 import os
 import subprocess
+import json
+import tempfile
+from datetime import datetime
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -142,6 +145,36 @@ def update_daily_cost(state, session_id, date, cost):
     new_state[session_id] = {"date": date, "cost": cost}
     total = sum((rec.get("cost") or 0) for rec in new_state.values())
     return new_state, total
+
+
+def _state_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "statusline_cost.json")
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(path, state):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".statusline_cost.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":

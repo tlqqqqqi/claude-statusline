@@ -1,5 +1,6 @@
 import unittest
 import statusline as s
+import os
 
 
 class TestFmtTokens(unittest.TestCase):
@@ -165,6 +166,49 @@ class TestUpdateDailyCost(unittest.TestCase):
         state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
         self.assertNotIn("bad", state)
         self.assertAlmostEqual(total, 1.50)
+
+
+class TestStateIO(unittest.TestCase):
+    def test_load_missing_file_returns_empty(self):
+        self.assertEqual(s.load_state("/no/such/path/state.json"), {})
+
+    def test_load_corrupt_json_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            with open(p, "w") as f:
+                f.write("{not json")
+            self.assertEqual(s.load_state(p), {})
+
+    def test_load_non_dict_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            with open(p, "w") as f:
+                f.write("[1, 2, 3]")
+            self.assertEqual(s.load_state(p), {})
+
+    def test_save_then_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            data = {"sid1": {"date": "2026-06-19", "cost": 5.55}}
+            s.save_state(p, data)
+            self.assertEqual(s.load_state(p), data)
+
+    def test_save_creates_missing_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "nested", "state.json")
+            s.save_state(p, {"a": 1})
+            self.assertTrue(os.path.exists(p))
+
+    def test_state_path_respects_env(self):
+        old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/cfgdir"
+        try:
+            self.assertEqual(s._state_path(), "/tmp/cfgdir/statusline_cost.json")
+        finally:
+            if old is None:
+                del os.environ["CLAUDE_CONFIG_DIR"]
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old
 
 
 if __name__ == "__main__":
