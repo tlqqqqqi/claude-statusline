@@ -211,5 +211,72 @@ class TestStateIO(unittest.TestCase):
                 os.environ["CLAUDE_CONFIG_DIR"] = old
 
 
+class TestDailyTotalFor(unittest.TestCase):
+    def _isolated_env(self, d):
+        # Point the state file at a temp dir for the duration of a test.
+        os.environ["CLAUDE_CONFIG_DIR"] = d
+
+    def test_none_without_session_id(self):
+        self.assertIsNone(s.daily_total_for({"cost": {"total_cost_usd": 1.0}}))
+
+    def test_records_and_returns_total(self):
+        from datetime import datetime
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            self._isolated_env(d)
+            try:
+                now = datetime(2026, 6, 19, 12, 0, 0)
+                t1 = s.daily_total_for(
+                    {"session_id": "a", "cost": {"total_cost_usd": 5.47}}, now=now
+                )
+                self.assertAlmostEqual(t1, 5.47)
+                t2 = s.daily_total_for(
+                    {"session_id": "b", "cost": {"total_cost_usd": 0.08}}, now=now
+                )
+                self.assertAlmostEqual(t2, 5.55)
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+
+class TestRenderDaily(unittest.TestCase):
+    def _data(self):
+        return {
+            "session_id": "sid-x",
+            "model": {"display_name": "Opus 4.8"},
+            "workspace": {"current_dir": "/x/ContextPlugin"},
+            "context_window": {
+                "context_window_size": 1000000,
+                "remaining_percentage": 81,
+                "total_input_tokens": 187000,
+            },
+            "cost": {"total_cost_usd": 0.08, "total_duration_ms": 423000},
+        }
+
+    def test_daily_segment_present_and_formatted(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = d
+            try:
+                line2 = s.render(self._data()).split("\n")[1]
+                self.assertIn("$0.08", line2)
+                self.assertIn("(day)", line2)
+                self.assertIn("·", line2.split("$0.08")[1])
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_daily_segment_omitted_without_session_id(self):
+        data = self._data()
+        del data["session_id"]
+        line2 = s.render(data).split("\n")[1]
+        self.assertIn("$0.08", line2)
+        self.assertNotIn("(day)", line2)
+
+
 if __name__ == "__main__":
     unittest.main()

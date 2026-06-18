@@ -93,7 +93,12 @@ def render(data):
     bar = battery_bar(remaining)
     line2 = f"{color}{bar} {pct}%{RESET}"
     line2 += f"{SEP}{color}{CTX} {fmt_tokens(tokens)}{RESET}"
-    line2 += f"{SEP}{DIM}${cost:.2f}{RESET}"
+    cost_seg = f"{DIM}${cost:.2f}"
+    daily = daily_total_for(data)
+    if daily is not None:
+        cost_seg += f" · ${daily:.2f} (day)"
+    cost_seg += RESET
+    line2 += f"{SEP}{cost_seg}"
     line2 += f"{SEP}{DIM}{CLOCK} {fmt_duration(duration)}{RESET}"
 
     return line1 + "\n" + line2
@@ -175,6 +180,22 @@ def save_state(path, state):
         except OSError:
             pass
         raise
+
+
+def daily_total_for(data, now=None):
+    session_id = data.get("session_id")
+    if not session_id:
+        return None
+    cost = (data.get("cost") or {}).get("total_cost_usd") or 0
+    today = (now or datetime.now()).strftime("%Y-%m-%d")
+    path = _state_path()
+    state = load_state(path)
+    state, total = update_daily_cost(state, session_id, today, float(cost))
+    try:
+        save_state(path, state)
+    except OSError:
+        pass
+    return total
 
 
 if __name__ == "__main__":
