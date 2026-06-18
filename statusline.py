@@ -3,6 +3,9 @@
 
 import os
 import subprocess
+import json
+import tempfile
+from datetime import datetime
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -90,7 +93,12 @@ def render(data):
     bar = battery_bar(remaining)
     line2 = f"{color}{bar} {pct}%{RESET}"
     line2 += f"{SEP}{color}{CTX} {fmt_tokens(tokens)}{RESET}"
-    line2 += f"{SEP}{DIM}${cost:.2f}{RESET}"
+    cost_seg = f"{DIM}${cost:.2f}"
+    daily = daily_total_for(data)
+    if daily is not None:
+        cost_seg += f" · ${daily:.2f} (day)"
+    cost_seg += RESET
+    line2 += f"{SEP}{cost_seg}"
     line2 += f"{SEP}{DIM}{CLOCK} {fmt_duration(duration)}{RESET}"
 
     return line1 + "\n" + line2
@@ -131,6 +139,63 @@ def fmt_window(size):
     if size >= 1000:
         return f"{round(size / 1000)}k"
     return "?"
+
+
+def update_daily_cost(state, session_id, date, cost):
+    new_state = {
+        sid: rec
+        for sid, rec in state.items()
+        if isinstance(rec, dict) and rec.get("date") == date
+    }
+    new_state[session_id] = {"date": date, "cost": cost}
+    total = sum((rec.get("cost") or 0) for rec in new_state.values())
+    return new_state, total
+
+
+def _state_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "statusline_cost.json")
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(path, state):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".statusline_cost.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def daily_total_for(data, now=None):
+    session_id = data.get("session_id")
+    if not session_id:
+        return None
+    cost = (data.get("cost") or {}).get("total_cost_usd") or 0
+    today = (now or datetime.now()).strftime("%Y-%m-%d")
+    path = _state_path()
+    state = load_state(path)
+    state, total = update_daily_cost(state, session_id, today, float(cost))
+    try:
+        save_state(path, state)
+    except Exception:
+        pass
+    return total
 
 
 if __name__ == "__main__":

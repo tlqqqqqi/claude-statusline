@@ -4,12 +4,12 @@ A two-line [Claude Code](https://code.claude.com) status line: a **battery bar o
 
 ```
 [Opus 4.8 (1M) · high]   ContextPlugin  │   feature/auth
-▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08  │   7m 3s
+▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s
 ```
 
 **Line 1** — model + context window size + reasoning effort (`effort.level`; omitted when the model doesn't support it), current folder (real basename), and git branch (only inside a repo; `*` when dirty).
 
-**Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), session cost, and session duration.
+**Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), cost (`$session · $today (day)`), and session duration.
 
 ### Color thresholds
 
@@ -20,6 +20,20 @@ The battery bar and the token number share one color, driven by occupied tokens:
 | ≤ 200k | white |
 | 200k – 400k | yellow |
 | > 400k | red |
+
+### Daily cost total
+
+`$5.55 (day)` is the summed cost of **every** Claude Code session on this
+machine for the current local day. Claude Code's status line input only
+reports the *current* session's cost, so the script aggregates it itself:
+each render upserts the session's cost into a small state file
+(`$CLAUDE_CONFIG_DIR/statusline_cost.json`, default `~/.claude/statusline_cost.json`), keyed by
+`session_id` and stamped with the local date. Entries from previous days are
+pruned automatically, which also resets the total at local midnight.
+
+**Limitation:** a session that spans local midnight (or is resumed on a later
+day) has its full cumulative cost attributed to the day of the next render,
+since Claude Code reports only a session-lifetime total.
 
 ## Install
 
@@ -37,6 +51,10 @@ The battery bar and the token number share one color, driven by occupied tokens:
    ```
 
 The bar updates on Claude Code events (new assistant message, `/compact`, permission/vim mode changes; debounced at 300ms). Those triggers go quiet while the session is idle, so the time-based segments (session duration, cost) would otherwise freeze. `refreshInterval` re-runs the script on a fixed timer to keep them live — `30` (seconds) is a light default; the minimum is `1`. Drop the field to run on events only.
+
+The script writes a small state file at `$CLAUDE_CONFIG_DIR/statusline_cost.json`
+(default `~/.claude/statusline_cost.json`) to track the daily cost total. Add it
+to your ignore lists if needed; delete it any time to reset the running total.
 
 ### Requirements
 - Python 3 (stdlib only)

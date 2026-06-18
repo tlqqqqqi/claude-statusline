@@ -1,5 +1,6 @@
 import unittest
 import statusline as s
+import os
 
 
 class TestFmtTokens(unittest.TestCase):
@@ -131,6 +132,159 @@ class TestRender(unittest.TestCase):
 
     def test_no_branch_when_not_repo(self):
         self.assertNotIn(s.GIT, s.render(self._data()))
+
+
+class TestUpdateDailyCost(unittest.TestCase):
+    def test_adds_new_session(self):
+        state, total = s.update_daily_cost({}, "sid1", "2026-06-19", 0.08)
+        self.assertEqual(state, {"sid1": {"date": "2026-06-19", "cost": 0.08}})
+        self.assertAlmostEqual(total, 0.08)
+
+    def test_updates_existing_session_not_double_counted(self):
+        start = {"sid1": {"date": "2026-06-19", "cost": 0.08}}
+        state, total = s.update_daily_cost(start, "sid1", "2026-06-19", 0.20)
+        self.assertEqual(state["sid1"]["cost"], 0.20)
+        self.assertAlmostEqual(total, 0.20)
+
+    def test_sums_multiple_today_sessions(self):
+        start = {"sid1": {"date": "2026-06-19", "cost": 5.47}}
+        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.08)
+        self.assertAlmostEqual(total, 5.55)
+        self.assertEqual(len(state), 2)
+
+    def test_prunes_stale_dates(self):
+        start = {
+            "old": {"date": "2026-06-18", "cost": 9.99},
+            "sid1": {"date": "2026-06-19", "cost": 1.00},
+        }
+        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
+        self.assertNotIn("old", state)
+        self.assertAlmostEqual(total, 1.50)
+
+    def test_ignores_malformed_records(self):
+        start = {"bad": "not-a-dict", "sid1": {"date": "2026-06-19", "cost": 1.0}}
+        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
+        self.assertNotIn("bad", state)
+        self.assertAlmostEqual(total, 1.50)
+
+
+class TestStateIO(unittest.TestCase):
+    def test_load_missing_file_returns_empty(self):
+        self.assertEqual(s.load_state("/no/such/path/state.json"), {})
+
+    def test_load_corrupt_json_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            with open(p, "w") as f:
+                f.write("{not json")
+            self.assertEqual(s.load_state(p), {})
+
+    def test_load_non_dict_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            with open(p, "w") as f:
+                f.write("[1, 2, 3]")
+            self.assertEqual(s.load_state(p), {})
+
+    def test_save_then_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            data = {"sid1": {"date": "2026-06-19", "cost": 5.55}}
+            s.save_state(p, data)
+            self.assertEqual(s.load_state(p), data)
+
+    def test_save_creates_missing_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "nested", "state.json")
+            s.save_state(p, {"a": 1})
+            self.assertTrue(os.path.exists(p))
+
+    def test_state_path_respects_env(self):
+        old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/cfgdir"
+        try:
+            self.assertEqual(s._state_path(), "/tmp/cfgdir/statusline_cost.json")
+        finally:
+            if old is None:
+                del os.environ["CLAUDE_CONFIG_DIR"]
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old
+
+
+class TestDailyTotalFor(unittest.TestCase):
+    def _isolated_env(self, d):
+        # Point the state file at a temp dir for the duration of a test.
+        os.environ["CLAUDE_CONFIG_DIR"] = d
+
+    def test_none_without_session_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            self._isolated_env(d)
+            try:
+                self.assertIsNone(s.daily_total_for({"cost": {"total_cost_usd": 1.0}}))
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_records_and_returns_total(self):
+        from datetime import datetime
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            self._isolated_env(d)
+            try:
+                now = datetime(2026, 6, 19, 12, 0, 0)
+                t1 = s.daily_total_for(
+                    {"session_id": "a", "cost": {"total_cost_usd": 5.47}}, now=now
+                )
+                self.assertAlmostEqual(t1, 5.47)
+                t2 = s.daily_total_for(
+                    {"session_id": "b", "cost": {"total_cost_usd": 0.08}}, now=now
+                )
+                self.assertAlmostEqual(t2, 5.55)
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+
+class TestRenderDaily(unittest.TestCase):
+    def _data(self):
+        return {
+            "session_id": "sid-x",
+            "model": {"display_name": "Opus 4.8"},
+            "workspace": {"current_dir": "/x/ContextPlugin"},
+            "context_window": {
+                "context_window_size": 1000000,
+                "remaining_percentage": 81,
+                "total_input_tokens": 187000,
+            },
+            "cost": {"total_cost_usd": 0.08, "total_duration_ms": 423000},
+        }
+
+    def test_daily_segment_present_and_formatted(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = d
+            try:
+                line2 = s.render(self._data()).split("\n")[1]
+                self.assertIn("$0.08", line2)
+                self.assertIn("(day)", line2)
+                self.assertIn("·", line2.split("$0.08")[1])
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_daily_segment_omitted_without_session_id(self):
+        data = self._data()
+        del data["session_id"]
+        line2 = s.render(data).split("\n")[1]
+        self.assertIn("$0.08", line2)
+        self.assertNotIn("(day)", line2)
 
 
 if __name__ == "__main__":
