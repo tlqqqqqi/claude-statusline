@@ -193,7 +193,7 @@ def daily_total_for(data, now=None):
     state, total = update_daily_cost(state, session_id, today, float(cost))
     try:
         save_state(path, state)
-    except OSError:
+    except Exception:
         pass
     return total
 
