@@ -133,5 +133,16 @@ def fmt_window(size):
     return "?"
 
 
+def update_daily_cost(state, session_id, date, cost):
+    new_state = {
+        sid: rec
+        for sid, rec in state.items()
+        if isinstance(rec, dict) and rec.get("date") == date
+    }
+    new_state[session_id] = {"date": date, "cost": cost}
+    total = sum((rec.get("cost") or 0) for rec in new_state.values())
+    return new_state, total
+
+
 if __name__ == "__main__":
     main()

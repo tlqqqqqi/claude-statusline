@@ -133,5 +133,39 @@ class TestRender(unittest.TestCase):
         self.assertNotIn(s.GIT, s.render(self._data()))
 
 
+class TestUpdateDailyCost(unittest.TestCase):
+    def test_adds_new_session(self):
+        state, total = s.update_daily_cost({}, "sid1", "2026-06-19", 0.08)
+        self.assertEqual(state, {"sid1": {"date": "2026-06-19", "cost": 0.08}})
+        self.assertAlmostEqual(total, 0.08)
+
+    def test_updates_existing_session_not_double_counted(self):
+        start = {"sid1": {"date": "2026-06-19", "cost": 0.08}}
+        state, total = s.update_daily_cost(start, "sid1", "2026-06-19", 0.20)
+        self.assertEqual(state["sid1"]["cost"], 0.20)
+        self.assertAlmostEqual(total, 0.20)
+
+    def test_sums_multiple_today_sessions(self):
+        start = {"sid1": {"date": "2026-06-19", "cost": 5.47}}
+        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.08)
+        self.assertAlmostEqual(total, 5.55)
+        self.assertEqual(len(state), 2)
+
+    def test_prunes_stale_dates(self):
+        start = {
+            "old": {"date": "2026-06-18", "cost": 9.99},
+            "sid1": {"date": "2026-06-19", "cost": 1.00},
+        }
+        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
+        self.assertNotIn("old", state)
+        self.assertAlmostEqual(total, 1.50)
+
+    def test_ignores_malformed_records(self):
+        start = {"bad": "not-a-dict", "sid1": {"date": "2026-06-19", "cost": 1.0}}
+        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
+        self.assertNotIn("bad", state)
+        self.assertAlmostEqual(total, 1.50)
+
+
 if __name__ == "__main__":
     unittest.main()
