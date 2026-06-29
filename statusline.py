@@ -141,15 +141,56 @@ def fmt_window(size):
     return "?"
 
 
+def _is_num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _normalize_state(state):
+    """Return state as {"days": {date: total}, "sessions": {sid: last_cost}}.
+
+    Migrates the legacy {sid: {"date", "cost"}} format by treating each
+    session's stored cost as its baseline (so an upgrade mid-day does not
+    re-count already-spent money: today starts fresh and only new deltas count).
+    """
+    if not isinstance(state, dict):
+        return {"days": {}, "sessions": {}}
+    if "days" in state or "sessions" in state:
+        days = state.get("days")
+        sessions = state.get("sessions")
+        return {
+            "days": {d: c for d, c in days.items() if _is_num(c)} if isinstance(days, dict) else {},
+            "sessions": {s: c for s, c in sessions.items() if _is_num(c)} if isinstance(sessions, dict) else {},
+        }
+    # Legacy format: migrate per-session costs into baselines.
+    sessions = {}
+    for sid, rec in state.items():
+        if isinstance(rec, dict) and _is_num(rec.get("cost")):
+            sessions[sid] = rec["cost"]
+    return {"days": {}, "sessions": sessions}
+
+
 def update_daily_cost(state, session_id, date, cost):
-    new_state = {
-        sid: rec
-        for sid, rec in state.items()
-        if isinstance(rec, dict) and rec.get("date") == date
-    }
-    new_state[session_id] = {"date": date, "cost": cost}
-    total = sum((rec.get("cost") or 0) for rec in new_state.values())
-    return new_state, total
+    """Attribute this render's cost *delta* for the session to `date`.
+
+    Only the increase in a session's cumulative cost since its last render is
+    added to the day's total, so a session that spent money on an earlier day
+    (but is merely still open) contributes nothing today. Old day buckets are
+    pruned; per-session baselines are kept so deltas stay correct across days.
+    """
+    norm = _normalize_state(state)
+    sessions = norm["sessions"]
+    prev = sessions.get(session_id)
+    prev = prev if _is_num(prev) else 0
+    delta = cost - prev
+    if delta < 0:
+        delta = 0  # cumulative cost should never decrease; ignore if it does
+
+    today = norm["days"].get(date)
+    today = today if _is_num(today) else 0
+    new_sessions = dict(sessions)
+    new_sessions[session_id] = cost
+    new_total = today + delta
+    return {"days": {date: new_total}, "sessions": new_sessions}, new_total
 
 
 def _state_path():
