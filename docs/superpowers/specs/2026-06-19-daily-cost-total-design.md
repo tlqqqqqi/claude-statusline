@@ -3,6 +3,18 @@
 **Date:** 2026-06-19
 **Status:** Approved for planning
 
+> **Amendment 2026-06-29:** The original "self-maintained state file" stored each
+> session's full cumulative cost stamped with the date of its last render. A
+> long-running session kept open across midnight (or simply idle while
+> `refreshInterval` re-rendered it) re-stamped its entry to the new day and
+> re-counted its entire prior spend — inflating "today" by yesterday's costs.
+> Fixed by switching to **per-day delta attribution**: the state is now
+> `{"days": {date: total}, "sessions": {sid: last_cost}}`, and each render adds
+> only the delta in a session's cumulative cost to the current day's bucket. The
+> legacy format migrates automatically (old costs become baselines). This
+> supersedes the "session spanning midnight" limitation below. See the README
+> "Daily cost total" section for the current behavior.
+
 ## Goal
 
 Show the **total daily spend across all sessions on the machine** next to the existing per-session cost in line 2 of the status line. The user wants, in the cost segment, an additional `(day)` figure:

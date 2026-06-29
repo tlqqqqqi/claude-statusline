@@ -135,37 +135,68 @@ class TestRender(unittest.TestCase):
 
 
 class TestUpdateDailyCost(unittest.TestCase):
-    def test_adds_new_session(self):
-        state, total = s.update_daily_cost({}, "sid1", "2026-06-19", 0.08)
-        self.assertEqual(state, {"sid1": {"date": "2026-06-19", "cost": 0.08}})
-        self.assertAlmostEqual(total, 0.08)
+    # New schema: {"days": {date: total}, "sessions": {sid: last_cumulative_cost}}.
+    # The daily total accumulates only the per-render *delta* in a session's
+    # cumulative cost, attributed to the day the delta is observed.
 
-    def test_updates_existing_session_not_double_counted(self):
-        start = {"sid1": {"date": "2026-06-19", "cost": 0.08}}
-        state, total = s.update_daily_cost(start, "sid1", "2026-06-19", 0.20)
-        self.assertEqual(state["sid1"]["cost"], 0.20)
-        self.assertAlmostEqual(total, 0.20)
+    def test_new_session_attributes_full_cost_today(self):
+        state, total = s.update_daily_cost(
+            {"days": {}, "sessions": {}}, "a", "2026-06-29", 1.5
+        )
+        self.assertAlmostEqual(total, 1.5)
+        self.assertAlmostEqual(state["sessions"]["a"], 1.5)
+        self.assertAlmostEqual(state["days"]["2026-06-29"], 1.5)
 
-    def test_sums_multiple_today_sessions(self):
-        start = {"sid1": {"date": "2026-06-19", "cost": 5.47}}
-        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.08)
-        self.assertAlmostEqual(total, 5.55)
-        self.assertEqual(len(state), 2)
+    def test_delta_only_attributed_to_today(self):
+        start = {"days": {"2026-06-29": 5.0}, "sessions": {"a": 5.0}}
+        state, total = s.update_daily_cost(start, "a", "2026-06-29", 7.5)
+        self.assertAlmostEqual(total, 7.5)  # 5.0 already + 2.5 new delta
+        self.assertAlmostEqual(state["sessions"]["a"], 7.5)
 
-    def test_prunes_stale_dates(self):
-        start = {
-            "old": {"date": "2026-06-18", "cost": 9.99},
-            "sid1": {"date": "2026-06-19", "cost": 1.00},
-        }
-        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
-        self.assertNotIn("old", state)
-        self.assertAlmostEqual(total, 1.50)
+    def test_sums_deltas_across_sessions(self):
+        start = {"days": {"2026-06-29": 2.5}, "sessions": {"a": 7.5}}
+        state, total = s.update_daily_cost(start, "b", "2026-06-29", 0.08)
+        self.assertAlmostEqual(total, 2.58)
+
+    def test_yesterday_session_does_not_leak_into_today(self):
+        # The bug: a session that did all its spend yesterday but whose window
+        # stays open re-renders today with the SAME cumulative cost. It must
+        # contribute $0 to today.
+        start = {"days": {"2026-06-28": 80.0}, "sessions": {"old": 80.0}}
+        state, total = s.update_daily_cost(start, "old", "2026-06-29", 80.0)
+        self.assertAlmostEqual(total, 0.0)
+        self.assertNotIn("2026-06-28", state["days"])
+
+    def test_spanning_session_splits_at_midnight(self):
+        # Session spent 80 yesterday, then 5 more today -> today shows only 5.
+        start = {"days": {"2026-06-28": 80.0}, "sessions": {"x": 80.0}}
+        state, total = s.update_daily_cost(start, "x", "2026-06-29", 85.0)
+        self.assertAlmostEqual(total, 5.0)
+
+    def test_negative_delta_clamped_to_zero(self):
+        start = {"days": {"2026-06-29": 5.0}, "sessions": {"a": 10.0}}
+        state, total = s.update_daily_cost(start, "a", "2026-06-29", 4.0)
+        self.assertAlmostEqual(total, 5.0)  # cost can't decrease; ignore
+        self.assertAlmostEqual(state["sessions"]["a"], 4.0)
+
+    def test_prunes_old_day_buckets(self):
+        start = {"days": {"2026-06-28": 999.0}, "sessions": {"a": 1.0}}
+        state, total = s.update_daily_cost(start, "a", "2026-06-29", 1.0)
+        self.assertEqual(list(state["days"].keys()), ["2026-06-29"])
+        self.assertAlmostEqual(total, 0.0)
+
+    def test_migrates_old_format_as_baseline_without_leaking(self):
+        # Old format {sid: {date, cost}} -> costs become baselines, today = 0,
+        # so an upgrade mid-day doesn't re-count already-spent money.
+        old = {"sessA": {"date": "2026-06-28", "cost": 80.0}}
+        state, total = s.update_daily_cost(old, "sessA", "2026-06-29", 80.0)
+        self.assertAlmostEqual(total, 0.0)
+        self.assertAlmostEqual(state["sessions"]["sessA"], 80.0)
 
     def test_ignores_malformed_records(self):
-        start = {"bad": "not-a-dict", "sid1": {"date": "2026-06-19", "cost": 1.0}}
-        state, total = s.update_daily_cost(start, "sid2", "2026-06-19", 0.50)
-        self.assertNotIn("bad", state)
-        self.assertAlmostEqual(total, 1.50)
+        start = {"days": {"2026-06-29": "bad"}, "sessions": {"junk": "nope"}}
+        state, total = s.update_daily_cost(start, "a", "2026-06-29", 0.5)
+        self.assertAlmostEqual(total, 0.5)
 
 
 class TestStateIO(unittest.TestCase):

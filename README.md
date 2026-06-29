@@ -23,17 +23,26 @@ The battery bar and the token number share one color, driven by occupied tokens:
 
 ### Daily cost total
 
-`$5.55 (day)` is the summed cost of **every** Claude Code session on this
+`$5.55 (day)` is the spend across **every** Claude Code session on this
 machine for the current local day. Claude Code's status line input only
-reports the *current* session's cost, so the script aggregates it itself:
-each render upserts the session's cost into a small state file
-(`$CLAUDE_CONFIG_DIR/statusline_cost.json`, default `~/.claude/statusline_cost.json`), keyed by
-`session_id` and stamped with the local date. Entries from previous days are
-pruned automatically, which also resets the total at local midnight.
+reports the *current* session's cumulative cost, so the script aggregates it
+itself in a small state file (`$CLAUDE_CONFIG_DIR/statusline_cost.json`,
+default `~/.claude/statusline_cost.json`).
 
-**Limitation:** a session that spans local midnight (or is resumed on a later
-day) has its full cumulative cost attributed to the day of the next render,
-since Claude Code reports only a session-lifetime total.
+Attribution is **per-day delta**: on each render the script adds only the
+*increase* in a session's cumulative cost since its last render to the current
+day's bucket, keyed by the local date. So the total resets to `$0.00` at local
+midnight, and a session that spent money earlier — but is merely still open
+(its window kept alive by `refreshInterval`) — contributes nothing to today.
+A session that spans midnight has yesterday's spend counted yesterday and only
+today's new spend counted today.
+
+State shape: `{"days": {"<YYYY-MM-DD>": <total>}, "sessions": {"<session_id>":
+<last cumulative cost>}}`. Old day buckets are pruned; per-session baselines
+are retained so deltas stay correct across days (including resumed sessions).
+The legacy `{session_id: {date, cost}}` format is migrated automatically on
+first render — existing costs become baselines, so upgrading mid-day does not
+re-count money already spent.
 
 ## Install
 
