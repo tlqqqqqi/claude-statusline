@@ -469,6 +469,40 @@ class TestLatestCodexInfo(unittest.TestCase):
             self.assertEqual(info["model"], "gpt-5.6-sol")
             self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 4.0)
 
+    def _write_config(self, home, text):
+        with open(os.path.join(home, "config.toml"), "w") as f:
+            f.write(text)
+
+    def test_config_defaults_used(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_config(home, 'model = "gpt-5.6-sol"\n'
+                                     'model_reasoning_effort = "high"\n')
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["model"], "gpt-5.6-sol")
+            self.assertEqual(info["effort"], "high")
+
+    def test_config_wins_over_session(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_config(home, 'model = "gpt-5.6-sol"\n'
+                                     'model_reasoning_effort = "high"\n')
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_tc_line(model="gpt-5.5", effort=None)])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["model"], "gpt-5.6-sol")
+            self.assertEqual(info["effort"], "high")
+
+    def test_config_keys_inside_tables_ignored(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_config(home, 'personality = "pragmatic"\n'
+                                     '[projects."/x"]\n'
+                                     'model = "not-a-default"\n')
+            self.assertIsNone(s.latest_codex_info(home))
+
+    def test_config_strips_comments_and_single_quotes(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_config(home, "model = 'gpt-5.6-sol'  # picked in TUI\n")
+            self.assertEqual(s.latest_codex_info(home)["model"], "gpt-5.6-sol")
+
 
 class TestCodexSegment(unittest.TestCase):
     NOW = 1_783_800_000
@@ -482,8 +516,8 @@ class TestCodexSegment(unittest.TestCase):
     def test_quota_shows_both_windows_remaining(self):
         seg = s.codex_quota(self._rl(p=4.0, w=1.0), now_ts=self.NOW)
         self.assertIn("5h 96%", seg)
-        self.assertIn("wk 99%", seg)
-        self.assertIn("cdx", seg)
+        self.assertIn("week 99%", seg)
+        self.assertNotIn("cdx", seg)
 
     def test_quota_none_when_no_snapshot(self):
         self.assertIsNone(s.codex_quota(None, now_ts=self.NOW))
@@ -518,7 +552,7 @@ class TestCodexSegment(unittest.TestCase):
     def test_segment_quota_only_without_model(self):
         import re
         seg = s.codex_segment({"rate_limits": self._rl()}, now_ts=self.NOW)
-        self.assertIn("cdx", seg)
+        self.assertIn("5h 96%", seg)
         plain = re.sub(r"\x1b\[[0-9;]*m", "", seg)  # drop ANSI codes
         self.assertNotIn("[", plain)
 
@@ -560,11 +594,11 @@ class TestRenderCodex(unittest.TestCase):
             try:
                 lines = s.render(self._data()).split("\n")
                 self.assertEqual(len(lines), 3)
-                self.assertNotIn("cdx", lines[1])
+                self.assertNotIn("5h", lines[1])
                 self.assertIn("[gpt-5.6-sol]", lines[2])
-                self.assertIn("cdx", lines[2])
+                self.assertNotIn("cdx", lines[2])
                 self.assertIn("5h 96%", lines[2])
-                self.assertIn("wk 99%", lines[2])
+                self.assertIn("week 99%", lines[2])
             finally:
                 self._restore(old)
 
@@ -573,7 +607,7 @@ class TestRenderCodex(unittest.TestCase):
             old = self._with_codex_home(home)
             try:
                 out = s.render(self._data())
-                self.assertNotIn("cdx", out)
+                self.assertNotIn("5h", out)
                 self.assertEqual(len(out.split("\n")), 2)
             finally:
                 self._restore(old)

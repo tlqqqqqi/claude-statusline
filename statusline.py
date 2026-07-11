@@ -268,19 +268,57 @@ def _codex_scan_tail(path, tail_bytes=65536):
     return found
 
 
-def latest_codex_info(home=None, max_files=5):
-    """Newest Codex state from session rollouts, or None if nothing found.
+def _toml_value(raw):
+    raw = raw.strip()
+    if raw[:1] in ('"', "'"):
+        quote = raw[0]
+        end = raw.find(quote, 1)
+        return raw[1:end] if end > 0 else None
+    return raw.split("#", 1)[0].strip() or None
 
-    Codex CLI has no command that prints this, but its session rollout files
-    record a rate_limits object (primary = 5h window, secondary = weekly) in
-    every token_count event, and the selected model + reasoning effort in
-    every turn_context event. Filenames embed a sortable timestamp, so the
-    newest files are checked first; only their tails are read.
+
+def _codex_config_defaults(home):
+    """model / effort explicitly set in config.toml's top-level section.
+
+    Only lines before the first [table] header count — that is where TOML
+    keeps top-level keys, so a `model` inside some table is never mistaken
+    for the default. Stdlib tomllib needs 3.11+, hence the manual parse.
     """
-    pattern = os.path.join(_codex_home() if home is None else home,
-                           "sessions", "*", "*", "*", "rollout-*.jsonl")
+    out = {}
+    try:
+        with open(os.path.join(home, "config.toml")) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    break
+                key, eq, raw = line.partition("=")
+                if not eq:
+                    continue
+                key = key.strip()
+                if key == "model":
+                    out["model"] = _toml_value(raw)
+                elif key == "model_reasoning_effort":
+                    out["effort"] = _toml_value(raw)
+    except OSError:
+        return {}
+    return {k: v for k, v in out.items() if v}
+
+
+def latest_codex_info(home=None, max_files=5):
+    """Current Codex state (model, effort, rate limits), or None if nothing.
+
+    Codex CLI has no command that prints this. The selected model and
+    reasoning effort land in config.toml when chosen explicitly (that wins);
+    otherwise they come from the latest turn_context event of the session
+    rollout files, which also record a rate_limits object (primary = 5h
+    window, secondary = weekly) in every token_count event. Rollout filenames
+    embed a sortable timestamp, so the newest files are checked first; only
+    their tails are read.
+    """
+    home = _codex_home() if home is None else home
+    info = _codex_config_defaults(home)
+    pattern = os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")
     files = sorted(glob.glob(pattern), key=os.path.basename, reverse=True)
-    info = {}
     for path in files[:max_files]:
         for key, value in _codex_scan_tail(path).items():
             info.setdefault(key, value)
@@ -312,18 +350,18 @@ def color_for_remaining(pct):
 
 
 def codex_quota(rl, now_ts=None):
-    """Render 'cdx 5h N% · wk M%' (remaining quota), or None without data."""
+    """Render '5h N% · week M%' (remaining quota), or None without data."""
     if not isinstance(rl, dict):
         return None
     now_ts = time.time() if now_ts is None else now_ts
     parts = []
-    for label, key in (("5h", "primary"), ("wk", "secondary")):
+    for label, key in (("5h", "primary"), ("week", "secondary")):
         left = codex_window_left(rl.get(key), now_ts)
         if left is not None:
             parts.append(f"{color_for_remaining(left)}{label} {left}%{RESET}")
     if not parts:
         return None
-    return f"{DIM}cdx {RESET}" + f"{DIM} · {RESET}".join(parts)
+    return f"{DIM} · {RESET}".join(parts)
 
 
 def codex_segment(info, now_ts=None):

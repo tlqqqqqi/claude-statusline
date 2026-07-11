@@ -5,7 +5,7 @@ A three-line [Claude Code](https://code.claude.com) status line: a **battery bar
 ```
 [Opus 4.8 (1M) · high]   ContextPlugin  │   feature/auth
 ▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s
-[gpt-5.6-sol · high]  cdx 5h 93% · wk 99%
+[gpt-5.6-sol · high]  5h 93% · week 99%
 ```
 
 **Line 1** — model + context window size + reasoning effort (`effort.level`; omitted when the model doesn't support it), current folder (real basename), and git branch (only inside a repo; `*` when dirty).
@@ -49,23 +49,28 @@ re-count money already spent.
 
 ### Codex line
 
-`[gpt-5.6-sol · high]  cdx 5h 93% · wk 99%` is the state of your OpenAI
+`[gpt-5.6-sol · high]  5h 93% · week 99%` is the state of your OpenAI
 **Codex** install: the currently selected model and reasoning effort, then
 how much of the rate limit is still *unused* — the 5-hour window and the
-weekly window. Codex CLI has no command that prints this, but its session
-rollout files under `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`)
-record a `rate_limits` snapshot (used percent + reset time per window) in
-every `token_count` event, and the model + effort in every `turn_context`
-event. The script reads the tail of the newest rollout files — no network
-calls, no quota spent.
+weekly window. Codex CLI has no command that prints this, so the script
+reads its files directly (no network calls, no quota spent):
 
-The model/effort block reflects the last Codex session (effort is omitted
-while it's unset, i.e. the model's default). Each quota window is colored by
-what's left: dim above 25%, yellow at 25% and below, red at 10% and below. A
-snapshot only updates while Codex is actually running, so it can be stale;
-once a window's recorded reset time has passed, the script shows 100% for it.
-The line is omitted entirely when there is no Codex install or no snapshot
-to read.
+- **Model + effort** come from the top-level `model` /
+  `model_reasoning_effort` keys of `$CODEX_HOME/config.toml` — that's where
+  an explicit selection (e.g. via `/model` in the TUI) lands. When unset
+  there, they fall back to the latest `turn_context` event of the session
+  rollout files under `$CODEX_HOME/sessions/`; effort is omitted while Codex
+  leaves it null (the model's default).
+- **Quota** comes from the `rate_limits` snapshot (used percent + reset time
+  per window) that every `token_count` event of the rollout files records.
+  Only the tails of the newest files are read.
+
+Each quota window is colored by what's left: dim above 25%, yellow at 25%
+and below, red at 10% and below. A snapshot only updates while Codex is
+actually running, so it can be stale; once a window's recorded reset time
+has passed, the script shows 100% for it. The line is omitted entirely when
+there is no Codex install or nothing to read. (`$CODEX_HOME` defaults to
+`~/.codex`.)
 
 ## Install
 
