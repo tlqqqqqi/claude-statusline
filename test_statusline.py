@@ -74,6 +74,19 @@ class TestGitSegment(unittest.TestCase):
 
 
 class TestRender(unittest.TestCase):
+    def setUp(self):
+        # Point CODEX_HOME at an empty dir so tests don't read real ~/.codex.
+        self._codex_tmp = tempfile.TemporaryDirectory()
+        self._old_codex = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = self._codex_tmp.name
+
+    def tearDown(self):
+        if self._old_codex is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = self._old_codex
+        self._codex_tmp.cleanup()
+
     def _data(self, **ctx):
         base = {
             "model": {"display_name": "Opus 4.8"},
@@ -316,6 +329,171 @@ class TestRenderDaily(unittest.TestCase):
         line2 = s.render(data).split("\n")[1]
         self.assertIn("$0.08", line2)
         self.assertNotIn("(day)", line2)
+
+
+def _write_rollout(home, day, name, lines):
+    d = os.path.join(home, "sessions", "2026", "07", day)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, name)
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def _rl_line(primary_used=4.0, secondary_used=1.0, resets_at=9_999_999_999):
+    import json
+    return json.dumps({
+        "timestamp": "2026-07-12T00:00:00.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {},
+            "rate_limits": {
+                "primary": {
+                    "used_percent": primary_used,
+                    "window_minutes": 300,
+                    "resets_at": resets_at,
+                },
+                "secondary": {
+                    "used_percent": secondary_used,
+                    "window_minutes": 10080,
+                    "resets_at": resets_at,
+                },
+            },
+        },
+    })
+
+
+class TestCodexWindowLeft(unittest.TestCase):
+    NOW = 1_783_800_000
+
+    def test_remaining_is_100_minus_used(self):
+        win = {"used_percent": 4.0, "resets_at": self.NOW + 1000}
+        self.assertEqual(s.codex_window_left(win, self.NOW), 96)
+
+    def test_past_reset_means_full_window(self):
+        win = {"used_percent": 87.0, "resets_at": self.NOW - 1}
+        self.assertEqual(s.codex_window_left(win, self.NOW), 100)
+
+    def test_over_100_used_clamped_to_zero(self):
+        win = {"used_percent": 130.0, "resets_at": self.NOW + 1000}
+        self.assertEqual(s.codex_window_left(win, self.NOW), 0)
+
+    def test_missing_resets_at_still_computes(self):
+        self.assertEqual(s.codex_window_left({"used_percent": 25.0}, self.NOW), 75)
+
+    def test_malformed_returns_none(self):
+        self.assertIsNone(s.codex_window_left(None, self.NOW))
+        self.assertIsNone(s.codex_window_left({}, self.NOW))
+        self.assertIsNone(s.codex_window_left({"used_percent": "x"}, self.NOW))
+
+
+class TestLatestCodexRateLimits(unittest.TestCase):
+    def test_missing_home_returns_none(self):
+        self.assertIsNone(s.latest_codex_rate_limits("/no/such/codex/home"))
+
+    def test_reads_last_snapshot_of_newest_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "11", "rollout-2026-07-11T10-00-00-old.jsonl",
+                           [_rl_line(primary_used=50.0)])
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-new.jsonl",
+                           ['{"type":"event_msg","payload":{"type":"other"}}',
+                            _rl_line(primary_used=10.0),
+                            _rl_line(primary_used=4.0)])
+            rl = s.latest_codex_rate_limits(home)
+            self.assertEqual(rl["primary"]["used_percent"], 4.0)
+
+    def test_falls_back_when_newest_file_has_no_snapshot(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "11", "rollout-2026-07-11T10-00-00-old.jsonl",
+                           [_rl_line(primary_used=42.0)])
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-new.jsonl",
+                           ['{"type":"event_msg","payload":{"type":"other"}}'])
+            rl = s.latest_codex_rate_limits(home)
+            self.assertEqual(rl["primary"]["used_percent"], 42.0)
+
+    def test_ignores_corrupt_lines(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_rl_line(primary_used=7.0), '{broken "rate_limits"'])
+            rl = s.latest_codex_rate_limits(home)
+            self.assertEqual(rl["primary"]["used_percent"], 7.0)
+
+
+class TestCodexSegment(unittest.TestCase):
+    NOW = 1_783_800_000
+
+    def _rl(self, p=4.0, w=1.0):
+        return {
+            "primary": {"used_percent": p, "resets_at": self.NOW + 100},
+            "secondary": {"used_percent": w, "resets_at": self.NOW + 100},
+        }
+
+    def test_shows_both_windows_remaining(self):
+        seg = s.codex_segment(self._rl(p=4.0, w=1.0), now_ts=self.NOW)
+        self.assertIn("5h 96%", seg)
+        self.assertIn("wk 99%", seg)
+        self.assertIn("cdx", seg)
+
+    def test_none_when_no_snapshot(self):
+        self.assertIsNone(s.codex_segment(None, now_ts=self.NOW))
+
+    def test_none_when_both_windows_malformed(self):
+        self.assertIsNone(s.codex_segment({"primary": {}, "secondary": {}},
+                                          now_ts=self.NOW))
+
+    def test_low_remaining_colors(self):
+        self.assertIn(s.YELLOW, s.codex_segment(self._rl(p=80.0), now_ts=self.NOW))
+        self.assertIn(s.RED, s.codex_segment(self._rl(p=95.0), now_ts=self.NOW))
+        self.assertNotIn(s.YELLOW, s.codex_segment(self._rl(), now_ts=self.NOW))
+        self.assertNotIn(s.RED, s.codex_segment(self._rl(), now_ts=self.NOW))
+
+
+class TestRenderCodex(unittest.TestCase):
+    def _data(self):
+        return {
+            "model": {"display_name": "Opus 4.8"},
+            "workspace": {"current_dir": "/x/ContextPlugin"},
+            "context_window": {
+                "context_window_size": 1000000,
+                "remaining_percentage": 81,
+                "total_input_tokens": 187000,
+            },
+            "cost": {"total_cost_usd": 0.08, "total_duration_ms": 423000},
+        }
+
+    def _with_codex_home(self, home):
+        old = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = home
+        return old
+
+    def _restore(self, old):
+        if old is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = old
+
+    def test_segment_on_line2_when_data_present(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_rl_line(primary_used=4.0, secondary_used=1.0)])
+            old = self._with_codex_home(home)
+            try:
+                line2 = s.render(self._data()).split("\n")[1]
+                self.assertIn("cdx", line2)
+                self.assertIn("5h 96%", line2)
+                self.assertIn("wk 99%", line2)
+            finally:
+                self._restore(old)
+
+    def test_segment_omitted_without_codex(self):
+        with tempfile.TemporaryDirectory() as home:
+            old = self._with_codex_home(home)
+            try:
+                out = s.render(self._data())
+                self.assertNotIn("cdx", out)
+            finally:
+                self._restore(old)
 
 
 if __name__ == "__main__":
