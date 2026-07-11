@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Claude Code status line: free-context battery + occupied tokens."""
 
+import glob
 import os
 import subprocess
 import json
 import tempfile
+import time
 from datetime import datetime
 
 RESET = "\033[0m"
@@ -100,6 +102,9 @@ def render(data):
     cost_seg += RESET
     line2 += f"{SEP}{cost_seg}"
     line2 += f"{SEP}{DIM}{CLOCK} {fmt_duration(duration)}{RESET}"
+    codex = codex_segment(latest_codex_rate_limits())
+    if codex:
+        line2 += f"{SEP}{codex}"
 
     return line1 + "\n" + line2
 
@@ -221,6 +226,88 @@ def save_state(path, state):
         except OSError:
             pass
         raise
+
+
+def _codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def _rate_limits_from_tail(path, tail_bytes=65536):
+    """Return the last rate_limits snapshot in a rollout file's tail, or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            chunk = f.read()
+    except OSError:
+        return None
+    for line in reversed(chunk.splitlines()):
+        if b'"rate_limits"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue  # corrupt line, or a fragment cut by the tail seek
+        rl = (event.get("payload") or {}).get("rate_limits")
+        if isinstance(rl, dict):
+            return rl
+    return None
+
+
+def latest_codex_rate_limits(home=None, max_files=5):
+    """Newest rate_limits snapshot from Codex session rollouts, or None.
+
+    Codex CLI records a rate_limits object (primary = 5h window, secondary =
+    weekly) in every token_count event of its session rollout files. Filenames
+    embed a sortable timestamp, so the newest files are checked first; only
+    their tails are read.
+    """
+    pattern = os.path.join(_codex_home() if home is None else home,
+                           "sessions", "*", "*", "*", "rollout-*.jsonl")
+    files = sorted(glob.glob(pattern), key=os.path.basename, reverse=True)
+    for path in files[:max_files]:
+        rl = _rate_limits_from_tail(path)
+        if rl is not None:
+            return rl
+    return None
+
+
+def codex_window_left(window, now_ts):
+    """Percent of a rate-limit window still unused, or None if malformed.
+
+    A snapshot only updates while Codex runs, so it can be arbitrarily stale:
+    once past resets_at the window has refilled and the answer is 100.
+    """
+    if not isinstance(window, dict) or not _is_num(window.get("used_percent")):
+        return None
+    resets = window.get("resets_at")
+    if _is_num(resets) and now_ts >= resets:
+        return 100
+    return max(0, min(100, round(100 - window["used_percent"])))
+
+
+def color_for_remaining(pct):
+    if pct <= 10:
+        return RED
+    if pct <= 25:
+        return YELLOW
+    return DIM
+
+
+def codex_segment(rl, now_ts=None):
+    """Render 'cdx 5h N% · wk M%' (remaining quota), or None without data."""
+    if not isinstance(rl, dict):
+        return None
+    now_ts = time.time() if now_ts is None else now_ts
+    parts = []
+    for label, key in (("5h", "primary"), ("wk", "secondary")):
+        left = codex_window_left(rl.get(key), now_ts)
+        if left is not None:
+            parts.append(f"{color_for_remaining(left)}{label} {left}%{RESET}")
+    if not parts:
+        return None
+    return f"{DIM}cdx {RESET}" + f"{DIM} · {RESET}".join(parts)
 
 
 def daily_total_for(data, now=None):

@@ -4,12 +4,12 @@ A two-line [Claude Code](https://code.claude.com) status line: a **battery bar o
 
 ```
 [Opus 4.8 (1M) · high]   ContextPlugin  │   feature/auth
-▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s
+▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s  │  cdx 5h 93% · wk 99%
 ```
 
 **Line 1** — model + context window size + reasoning effort (`effort.level`; omitted when the model doesn't support it), current folder (real basename), and git branch (only inside a repo; `*` when dirty).
 
-**Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), cost (`$session · $today (day)`), and session duration.
+**Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), cost (`$session · $today (day)`), session duration, and remaining [Codex](https://github.com/openai/codex) quota (omitted when Codex isn't installed).
 
 ### Color thresholds
 
@@ -43,6 +43,21 @@ are retained so deltas stay correct across days (including resumed sessions).
 The legacy `{session_id: {date, cost}}` format is migrated automatically on
 first render — existing costs become baselines, so upgrading mid-day does not
 re-count money already spent.
+
+### Codex quota
+
+`cdx 5h 93% · wk 99%` is how much of your OpenAI **Codex** rate limit is still
+*unused*: the 5-hour window and the weekly window. Codex CLI has no command
+that prints this, but it records a `rate_limits` snapshot (used percent +
+reset time per window) in every `token_count` event of its session rollout
+files under `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`). The script
+reads the tail of the newest rollout files — no network calls, no quota spent.
+
+Each window is colored by what's left: dim above 25%, yellow at 25% and
+below, red at 10% and below. A snapshot only updates while Codex is actually
+running, so it can be stale; once a window's recorded reset time has passed,
+the script shows 100% for it. The segment is omitted entirely when there is
+no Codex install or no snapshot to read.
 
 ## Install
 
