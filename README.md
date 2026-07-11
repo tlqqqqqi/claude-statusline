@@ -44,6 +44,26 @@ The legacy `{session_id: {date, cost}}` format is migrated automatically on
 first render — existing costs become baselines, so upgrading mid-day does not
 re-count money already spent.
 
+### Codex line (optional)
+
+The [`codex` branch](https://github.com/tlqqqqqi/claude-statusline/tree/codex)
+adds a third line with the state of your OpenAI [Codex](https://github.com/openai/codex)
+install — selected model + reasoning effort and the remaining 5-hour / weekly
+rate-limit quota, read locally from `~/.codex` (no network calls, no quota
+spent):
+
+```
+[gpt-5.6-sol · high]  5h 93% · week 99%
+```
+
+`main` stays Claude-only. If you want the Codex line, install the script from
+that branch instead:
+
+```bash
+git checkout codex
+cp statusline.py ~/.claude/statusline.py
+```
+
 ## Install
 
 1. Copy the script into your Claude config dir:
