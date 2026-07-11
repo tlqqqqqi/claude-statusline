@@ -364,6 +364,22 @@ def _rl_line(primary_used=4.0, secondary_used=1.0, resets_at=9_999_999_999):
     })
 
 
+def _tc_line(model="gpt-5.6-sol", effort=None):
+    import json
+    return json.dumps({
+        "timestamp": "2026-07-12T00:00:00.000Z",
+        "type": "turn_context",
+        "payload": {
+            "turn_id": "t1",
+            "model": model,
+            "collaboration_mode": {
+                "mode": "default",
+                "settings": {"model": model, "reasoning_effort": effort},
+            },
+        },
+    })
+
+
 class TestCodexWindowLeft(unittest.TestCase):
     NOW = 1_783_800_000
 
@@ -388,9 +404,9 @@ class TestCodexWindowLeft(unittest.TestCase):
         self.assertIsNone(s.codex_window_left({"used_percent": "x"}, self.NOW))
 
 
-class TestLatestCodexRateLimits(unittest.TestCase):
+class TestLatestCodexInfo(unittest.TestCase):
     def test_missing_home_returns_none(self):
-        self.assertIsNone(s.latest_codex_rate_limits("/no/such/codex/home"))
+        self.assertIsNone(s.latest_codex_info("/no/such/codex/home"))
 
     def test_reads_last_snapshot_of_newest_file(self):
         with tempfile.TemporaryDirectory() as home:
@@ -400,8 +416,8 @@ class TestLatestCodexRateLimits(unittest.TestCase):
                            ['{"type":"event_msg","payload":{"type":"other"}}',
                             _rl_line(primary_used=10.0),
                             _rl_line(primary_used=4.0)])
-            rl = s.latest_codex_rate_limits(home)
-            self.assertEqual(rl["primary"]["used_percent"], 4.0)
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 4.0)
 
     def test_falls_back_when_newest_file_has_no_snapshot(self):
         with tempfile.TemporaryDirectory() as home:
@@ -409,15 +425,49 @@ class TestLatestCodexRateLimits(unittest.TestCase):
                            [_rl_line(primary_used=42.0)])
             _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-new.jsonl",
                            ['{"type":"event_msg","payload":{"type":"other"}}'])
-            rl = s.latest_codex_rate_limits(home)
-            self.assertEqual(rl["primary"]["used_percent"], 42.0)
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 42.0)
 
     def test_ignores_corrupt_lines(self):
         with tempfile.TemporaryDirectory() as home:
             _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
                            [_rl_line(primary_used=7.0), '{broken "rate_limits"'])
-            rl = s.latest_codex_rate_limits(home)
-            self.assertEqual(rl["primary"]["used_percent"], 7.0)
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 7.0)
+
+    def test_extracts_model_and_effort_from_turn_context(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_tc_line(model="gpt-5.6-sol", effort="high"),
+                            _rl_line()])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["model"], "gpt-5.6-sol")
+            self.assertEqual(info["effort"], "high")
+
+    def test_null_effort_stays_absent(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_tc_line(model="gpt-5.6-sol", effort=None)])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["model"], "gpt-5.6-sol")
+            self.assertIsNone(info.get("effort"))
+
+    def test_last_turn_context_wins(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_tc_line(model="gpt-5.5"),
+                            _tc_line(model="gpt-5.6-sol")])
+            self.assertEqual(s.latest_codex_info(home)["model"], "gpt-5.6-sol")
+
+    def test_merges_model_from_older_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "11", "rollout-2026-07-11T10-00-00-old.jsonl",
+                           [_tc_line(model="gpt-5.6-sol")])
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-new.jsonl",
+                           [_rl_line(primary_used=4.0)])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["model"], "gpt-5.6-sol")
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 4.0)
 
 
 class TestCodexSegment(unittest.TestCase):
@@ -429,24 +479,52 @@ class TestCodexSegment(unittest.TestCase):
             "secondary": {"used_percent": w, "resets_at": self.NOW + 100},
         }
 
-    def test_shows_both_windows_remaining(self):
-        seg = s.codex_segment(self._rl(p=4.0, w=1.0), now_ts=self.NOW)
+    def test_quota_shows_both_windows_remaining(self):
+        seg = s.codex_quota(self._rl(p=4.0, w=1.0), now_ts=self.NOW)
         self.assertIn("5h 96%", seg)
         self.assertIn("wk 99%", seg)
         self.assertIn("cdx", seg)
 
-    def test_none_when_no_snapshot(self):
+    def test_quota_none_when_no_snapshot(self):
+        self.assertIsNone(s.codex_quota(None, now_ts=self.NOW))
+
+    def test_quota_none_when_both_windows_malformed(self):
+        self.assertIsNone(s.codex_quota({"primary": {}, "secondary": {}},
+                                        now_ts=self.NOW))
+
+    def test_quota_low_remaining_colors(self):
+        self.assertIn(s.YELLOW, s.codex_quota(self._rl(p=80.0), now_ts=self.NOW))
+        self.assertIn(s.RED, s.codex_quota(self._rl(p=95.0), now_ts=self.NOW))
+        self.assertNotIn(s.YELLOW, s.codex_quota(self._rl(), now_ts=self.NOW))
+        self.assertNotIn(s.RED, s.codex_quota(self._rl(), now_ts=self.NOW))
+
+    def test_segment_model_effort_and_quota(self):
+        info = {"model": "gpt-5.6-sol", "effort": "high",
+                "rate_limits": self._rl()}
+        seg = s.codex_segment(info, now_ts=self.NOW)
+        self.assertIn("[gpt-5.6-sol · high]", seg)
+        self.assertIn("5h 96%", seg)
+
+    def test_segment_model_brackets_are_dim(self):
+        seg = s.codex_segment({"model": "gpt-5.6-sol"}, now_ts=self.NOW)
+        self.assertIn(f"{s.DIM}[gpt-5.6-sol]{s.RESET}", seg)
+
+    def test_segment_no_effort_when_absent(self):
+        seg = s.codex_segment({"model": "gpt-5.6-sol", "effort": None,
+                               "rate_limits": self._rl()}, now_ts=self.NOW)
+        self.assertIn("[gpt-5.6-sol]", seg)
+        self.assertNotIn("·", seg.split("]")[0])
+
+    def test_segment_quota_only_without_model(self):
+        import re
+        seg = s.codex_segment({"rate_limits": self._rl()}, now_ts=self.NOW)
+        self.assertIn("cdx", seg)
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", seg)  # drop ANSI codes
+        self.assertNotIn("[", plain)
+
+    def test_segment_none_when_empty(self):
         self.assertIsNone(s.codex_segment(None, now_ts=self.NOW))
-
-    def test_none_when_both_windows_malformed(self):
-        self.assertIsNone(s.codex_segment({"primary": {}, "secondary": {}},
-                                          now_ts=self.NOW))
-
-    def test_low_remaining_colors(self):
-        self.assertIn(s.YELLOW, s.codex_segment(self._rl(p=80.0), now_ts=self.NOW))
-        self.assertIn(s.RED, s.codex_segment(self._rl(p=95.0), now_ts=self.NOW))
-        self.assertNotIn(s.YELLOW, s.codex_segment(self._rl(), now_ts=self.NOW))
-        self.assertNotIn(s.RED, s.codex_segment(self._rl(), now_ts=self.NOW))
+        self.assertIsNone(s.codex_segment({}, now_ts=self.NOW))
 
 
 class TestRenderCodex(unittest.TestCase):
@@ -473,25 +551,30 @@ class TestRenderCodex(unittest.TestCase):
         else:
             os.environ["CODEX_HOME"] = old
 
-    def test_segment_on_line2_when_data_present(self):
+    def test_codex_is_own_third_line(self):
         with tempfile.TemporaryDirectory() as home:
             _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
-                           [_rl_line(primary_used=4.0, secondary_used=1.0)])
+                           [_tc_line(model="gpt-5.6-sol"),
+                            _rl_line(primary_used=4.0, secondary_used=1.0)])
             old = self._with_codex_home(home)
             try:
-                line2 = s.render(self._data()).split("\n")[1]
-                self.assertIn("cdx", line2)
-                self.assertIn("5h 96%", line2)
-                self.assertIn("wk 99%", line2)
+                lines = s.render(self._data()).split("\n")
+                self.assertEqual(len(lines), 3)
+                self.assertNotIn("cdx", lines[1])
+                self.assertIn("[gpt-5.6-sol]", lines[2])
+                self.assertIn("cdx", lines[2])
+                self.assertIn("5h 96%", lines[2])
+                self.assertIn("wk 99%", lines[2])
             finally:
                 self._restore(old)
 
-    def test_segment_omitted_without_codex(self):
+    def test_two_lines_without_codex(self):
         with tempfile.TemporaryDirectory() as home:
             old = self._with_codex_home(home)
             try:
                 out = s.render(self._data())
                 self.assertNotIn("cdx", out)
+                self.assertEqual(len(out.split("\n")), 2)
             finally:
                 self._restore(old)
 

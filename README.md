@@ -1,15 +1,18 @@
 # claude-statusline
 
-A two-line [Claude Code](https://code.claude.com) status line: a **battery bar of free context** plus the **occupied context in tokens**, color-coded by absolute thresholds. Nerd Font glyphs, no external dependencies (Python 3 stdlib only — no `jq`).
+A three-line [Claude Code](https://code.claude.com) status line: a **battery bar of free context** plus the **occupied context in tokens**, color-coded by absolute thresholds, and a **Codex line** with the selected model and remaining quota. Nerd Font glyphs, no external dependencies (Python 3 stdlib only — no `jq`).
 
 ```
 [Opus 4.8 (1M) · high]   ContextPlugin  │   feature/auth
-▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s  │  cdx 5h 93% · wk 99%
+▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s
+[gpt-5.6-sol · high]  cdx 5h 93% · wk 99%
 ```
 
 **Line 1** — model + context window size + reasoning effort (`effort.level`; omitted when the model doesn't support it), current folder (real basename), and git branch (only inside a repo; `*` when dirty).
 
-**Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), cost (`$session · $today (day)`), session duration, and remaining [Codex](https://github.com/openai/codex) quota (omitted when Codex isn't installed).
+**Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), cost (`$session · $today (day)`), and session duration.
+
+**Line 3** — [Codex](https://github.com/openai/codex): selected model + reasoning effort (dim, in brackets) and remaining quota. Omitted entirely when Codex isn't installed.
 
 ### Color thresholds
 
@@ -44,20 +47,25 @@ The legacy `{session_id: {date, cost}}` format is migrated automatically on
 first render — existing costs become baselines, so upgrading mid-day does not
 re-count money already spent.
 
-### Codex quota
+### Codex line
 
-`cdx 5h 93% · wk 99%` is how much of your OpenAI **Codex** rate limit is still
-*unused*: the 5-hour window and the weekly window. Codex CLI has no command
-that prints this, but it records a `rate_limits` snapshot (used percent +
-reset time per window) in every `token_count` event of its session rollout
-files under `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`). The script
-reads the tail of the newest rollout files — no network calls, no quota spent.
+`[gpt-5.6-sol · high]  cdx 5h 93% · wk 99%` is the state of your OpenAI
+**Codex** install: the currently selected model and reasoning effort, then
+how much of the rate limit is still *unused* — the 5-hour window and the
+weekly window. Codex CLI has no command that prints this, but its session
+rollout files under `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`)
+record a `rate_limits` snapshot (used percent + reset time per window) in
+every `token_count` event, and the model + effort in every `turn_context`
+event. The script reads the tail of the newest rollout files — no network
+calls, no quota spent.
 
-Each window is colored by what's left: dim above 25%, yellow at 25% and
-below, red at 10% and below. A snapshot only updates while Codex is actually
-running, so it can be stale; once a window's recorded reset time has passed,
-the script shows 100% for it. The segment is omitted entirely when there is
-no Codex install or no snapshot to read.
+The model/effort block reflects the last Codex session (effort is omitted
+while it's unset, i.e. the model's default). Each quota window is colored by
+what's left: dim above 25%, yellow at 25% and below, red at 10% and below. A
+snapshot only updates while Codex is actually running, so it can be stale;
+once a window's recorded reset time has passed, the script shows 100% for it.
+The line is omitted entirely when there is no Codex install or no snapshot
+to read.
 
 ## Install
 

@@ -102,11 +102,12 @@ def render(data):
     cost_seg += RESET
     line2 += f"{SEP}{cost_seg}"
     line2 += f"{SEP}{DIM}{CLOCK} {fmt_duration(duration)}{RESET}"
-    codex = codex_segment(latest_codex_rate_limits())
-    if codex:
-        line2 += f"{SEP}{codex}"
 
-    return line1 + "\n" + line2
+    out = line1 + "\n" + line2
+    codex = codex_segment(latest_codex_info())
+    if codex:
+        out += "\n" + codex
+    return out
 
 
 def main():
@@ -232,8 +233,11 @@ def _codex_home():
     return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
 
-def _rate_limits_from_tail(path, tail_bytes=65536):
-    """Return the last rate_limits snapshot in a rollout file's tail, or None."""
+def _codex_scan_tail(path, tail_bytes=65536):
+    """Latest rate_limits / model / effort found in a rollout file's tail.
+
+    Scans newest lines first, so each key reflects its most recent event.
+    """
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -241,36 +245,48 @@ def _rate_limits_from_tail(path, tail_bytes=65536):
             f.seek(max(0, size - tail_bytes))
             chunk = f.read()
     except OSError:
-        return None
+        return {}
+    found = {}
     for line in reversed(chunk.splitlines()):
-        if b'"rate_limits"' not in line:
+        want_rl = "rate_limits" not in found and b'"rate_limits"' in line
+        want_tc = "model" not in found and b'"turn_context"' in line
+        if not (want_rl or want_tc):
             continue
         try:
             event = json.loads(line)
         except ValueError:
             continue  # corrupt line, or a fragment cut by the tail seek
-        rl = (event.get("payload") or {}).get("rate_limits")
-        if isinstance(rl, dict):
-            return rl
-    return None
+        payload = event.get("payload") or {}
+        if want_rl and isinstance(payload.get("rate_limits"), dict):
+            found["rate_limits"] = payload["rate_limits"]
+        if want_tc and event.get("type") == "turn_context" and payload.get("model"):
+            found["model"] = payload["model"]
+            settings = (payload.get("collaboration_mode") or {}).get("settings") or {}
+            found["effort"] = settings.get("reasoning_effort")
+        if "rate_limits" in found and "model" in found:
+            break
+    return found
 
 
-def latest_codex_rate_limits(home=None, max_files=5):
-    """Newest rate_limits snapshot from Codex session rollouts, or None.
+def latest_codex_info(home=None, max_files=5):
+    """Newest Codex state from session rollouts, or None if nothing found.
 
-    Codex CLI records a rate_limits object (primary = 5h window, secondary =
-    weekly) in every token_count event of its session rollout files. Filenames
-    embed a sortable timestamp, so the newest files are checked first; only
-    their tails are read.
+    Codex CLI has no command that prints this, but its session rollout files
+    record a rate_limits object (primary = 5h window, secondary = weekly) in
+    every token_count event, and the selected model + reasoning effort in
+    every turn_context event. Filenames embed a sortable timestamp, so the
+    newest files are checked first; only their tails are read.
     """
     pattern = os.path.join(_codex_home() if home is None else home,
                            "sessions", "*", "*", "*", "rollout-*.jsonl")
     files = sorted(glob.glob(pattern), key=os.path.basename, reverse=True)
+    info = {}
     for path in files[:max_files]:
-        rl = _rate_limits_from_tail(path)
-        if rl is not None:
-            return rl
-    return None
+        for key, value in _codex_scan_tail(path).items():
+            info.setdefault(key, value)
+        if "rate_limits" in info and "model" in info:
+            break
+    return info or None
 
 
 def codex_window_left(window, now_ts):
@@ -295,7 +311,7 @@ def color_for_remaining(pct):
     return DIM
 
 
-def codex_segment(rl, now_ts=None):
+def codex_quota(rl, now_ts=None):
     """Render 'cdx 5h N% · wk M%' (remaining quota), or None without data."""
     if not isinstance(rl, dict):
         return None
@@ -308,6 +324,27 @@ def codex_segment(rl, now_ts=None):
     if not parts:
         return None
     return f"{DIM}cdx {RESET}" + f"{DIM} · {RESET}".join(parts)
+
+
+def codex_segment(info, now_ts=None):
+    """Render the Codex status line: '[model · effort]  cdx 5h N% · wk M%'.
+
+    Model and effort come from the latest turn_context (effort is omitted
+    when Codex leaves it null, i.e. the model's default). Returns None when
+    there is nothing to show.
+    """
+    if not isinstance(info, dict):
+        return None
+    parts = []
+    if info.get("model"):
+        head = info["model"]
+        if info.get("effort"):
+            head += f" · {info['effort']}"
+        parts.append(f"{DIM}[{head}]{RESET}")
+    quota = codex_quota(info.get("rate_limits"), now_ts)
+    if quota:
+        parts.append(quota)
+    return "  ".join(parts) if parts else None
 
 
 def daily_total_for(data, now=None):
