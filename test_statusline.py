@@ -340,10 +340,11 @@ def _write_rollout(home, day, name, lines):
     return path
 
 
-def _rl_line(primary_used=4.0, secondary_used=1.0, resets_at=9_999_999_999):
+def _rl_line(primary_used=4.0, secondary_used=1.0, resets_at=9_999_999_999,
+             ts="2026-07-12T00:00:00.000Z"):
     import json
     return json.dumps({
-        "timestamp": "2026-07-12T00:00:00.000Z",
+        "timestamp": ts,
         "type": "event_msg",
         "payload": {
             "type": "token_count",
@@ -394,6 +395,14 @@ class TestCodexWindowLeft(unittest.TestCase):
     def test_over_100_used_clamped_to_zero(self):
         win = {"used_percent": 130.0, "resets_at": self.NOW + 1000}
         self.assertEqual(s.codex_window_left(win, self.NOW), 0)
+
+    def test_remaining_is_floored_never_overstated(self):
+        # 0.4% used is NOT "100% left": floor, don't round.
+        win = {"used_percent": 0.4, "resets_at": self.NOW + 1000}
+        self.assertEqual(s.codex_window_left(win, self.NOW), 99)
+        self.assertEqual(
+            s.codex_window_left({"used_percent": 0.0, "resets_at": self.NOW + 1000},
+                                self.NOW), 100)
 
     def test_missing_resets_at_still_computes(self):
         self.assertEqual(s.codex_window_left({"used_percent": 25.0}, self.NOW), 75)
@@ -468,6 +477,77 @@ class TestLatestCodexInfo(unittest.TestCase):
             info = s.latest_codex_info(home)
             self.assertEqual(info["model"], "gpt-5.6-sol")
             self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 4.0)
+
+    def test_freshest_snapshot_wins_regardless_of_file_name(self):
+        # The stale-quota bug: a long-running session started EARLIER keeps
+        # the freshest rate_limits, while a newer-started (idle) session file
+        # holds an old snapshot. The newest event timestamp must win, not the
+        # newest file name.
+        with tempfile.TemporaryDirectory() as home:
+            active = _write_rollout(
+                home, "12", "rollout-2026-07-12T00-27-00-active.jsonl",
+                [_rl_line(primary_used=12.0, secondary_used=2.0,
+                          ts="2026-07-12T02:50:00.000Z")])
+            idle = _write_rollout(
+                home, "12", "rollout-2026-07-12T01-35-00-idle.jsonl",
+                [_rl_line(primary_used=2.0, secondary_used=0.4,
+                          ts="2026-07-12T01:35:10.000Z")])
+            os.utime(idle, (1_000_000_100, 1_000_000_100))
+            os.utime(active, (1_000_000_200, 1_000_000_200))
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 12.0)
+
+    def test_timestamp_formats_compared_as_time_not_text(self):
+        # "…00Z" sorts lexicographically AFTER "…00.500Z" although it is the
+        # EARLIER instant — timestamps must be compared as time, not text.
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T02-00-00-later.jsonl",
+                           [_rl_line(primary_used=12.0,
+                                     ts="2026-07-12T02:50:00.500Z")])
+            _write_rollout(home, "12", "rollout-2026-07-12T02-00-01-earlier.jsonl",
+                           [_rl_line(primary_used=2.0,
+                                     ts="2026-07-12T02:50:00Z")])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 12.0)
+
+    def test_valid_json_with_wrong_shapes_is_skipped_not_fatal(self):
+        # Lines that parse as JSON but aren't shaped like events must be
+        # skipped — an AttributeError here would kill the whole status line.
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_rl_line(primary_used=7.0),
+                            '["rate_limits"]',
+                            '{"type":"event_msg","payload":["rate_limits"]}',
+                            '{"type":"turn_context","payload":{"model":"m",'
+                            '"collaboration_mode":{"settings":["reasoning_effort"]}}}'])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 7.0)
+
+    def test_equal_timestamps_keep_first_mtime_ordered_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            a = _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-a.jsonl",
+                               [_rl_line(primary_used=5.0)])
+            b = _write_rollout(home, "12", "rollout-2026-07-12T01-00-01-b.jsonl",
+                               [_rl_line(primary_used=9.0)])
+            os.utime(a, (1_000_000_200, 1_000_000_200))
+            os.utime(b, (1_000_000_100, 1_000_000_100))
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 5.0)
+
+    def test_snapshot_timestamps_compared_across_files(self):
+        # Even when the stale file has the newer mtime, the event timestamp
+        # inside decides which snapshot is current.
+        with tempfile.TemporaryDirectory() as home:
+            fresh = _write_rollout(
+                home, "12", "rollout-2026-07-12T00-27-00-fresh.jsonl",
+                [_rl_line(primary_used=12.0, ts="2026-07-12T02:50:00.000Z")])
+            stale = _write_rollout(
+                home, "12", "rollout-2026-07-12T01-35-00-stale.jsonl",
+                [_rl_line(primary_used=2.0, ts="2026-07-12T01:35:10.000Z")])
+            os.utime(fresh, (1_000_000_100, 1_000_000_100))
+            os.utime(stale, (1_000_000_200, 1_000_000_200))
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 12.0)
 
     def _write_config(self, home, text):
         with open(os.path.join(home, "config.toml"), "w") as f:

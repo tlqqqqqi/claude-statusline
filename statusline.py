@@ -104,7 +104,10 @@ def render(data):
     line2 += f"{SEP}{DIM}{CLOCK} {fmt_duration(duration)}{RESET}"
 
     out = line1 + "\n" + line2
-    codex = codex_segment(latest_codex_info())
+    try:
+        codex = codex_segment(latest_codex_info())
+    except Exception:
+        codex = None  # never let the Codex extras take the status line down
     if codex:
         out += "\n" + codex
     return out
@@ -233,10 +236,27 @@ def _codex_home():
     return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
 
-def _codex_scan_tail(path, tail_bytes=65536):
+def _event_ts(ts):
+    """ISO-8601 event timestamp -> epoch seconds; 0.0 when absent/unparsable.
+
+    Compared as time, not text: "…00Z" sorts lexicographically after the
+    later "…00.500Z", so string comparison would resurrect stale snapshots.
+    """
+    if not isinstance(ts, str) or not ts:
+        return 0.0
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _codex_scan_tail(path, tail_bytes=262144):
     """Latest rate_limits / model / effort found in a rollout file's tail.
 
     Scans newest lines first, so each key reflects its most recent event.
+    Each found key comes with its event epoch time (<key>_ts) for cross-file
+    freshness comparison. Lines that parse but aren't shaped like events are
+    skipped — a malformed rollout must never take the status line down.
     """
     try:
         with open(path, "rb") as f:
@@ -256,16 +276,33 @@ def _codex_scan_tail(path, tail_bytes=65536):
             event = json.loads(line)
         except ValueError:
             continue  # corrupt line, or a fragment cut by the tail seek
-        payload = event.get("payload") or {}
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        ts = _event_ts(event.get("timestamp"))
         if want_rl and isinstance(payload.get("rate_limits"), dict):
             found["rate_limits"] = payload["rate_limits"]
-        if want_tc and event.get("type") == "turn_context" and payload.get("model"):
+            found["rate_limits_ts"] = ts
+        if want_tc and event.get("type") == "turn_context" \
+                and isinstance(payload.get("model"), str):
+            mode = payload.get("collaboration_mode")
+            settings = mode.get("settings") if isinstance(mode, dict) else None
+            effort = settings.get("reasoning_effort") if isinstance(settings, dict) else None
             found["model"] = payload["model"]
-            settings = (payload.get("collaboration_mode") or {}).get("settings") or {}
-            found["effort"] = settings.get("reasoning_effort")
+            found["effort"] = effort if isinstance(effort, str) else None
+            found["model_ts"] = ts
         if "rate_limits" in found and "model" in found:
             break
     return found
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
 
 
 def _toml_value(raw):
@@ -304,26 +341,44 @@ def _codex_config_defaults(home):
     return {k: v for k, v in out.items() if v}
 
 
-def latest_codex_info(home=None, max_files=5):
+def latest_codex_info(home=None, max_files=8):
     """Current Codex state (model, effort, rate limits), or None if nothing.
 
     Codex CLI has no command that prints this. The selected model and
     reasoning effort land in config.toml when chosen explicitly (that wins);
     otherwise they come from the latest turn_context event of the session
     rollout files, which also record a rate_limits object (primary = 5h
-    window, secondary = weekly) in every token_count event. Rollout filenames
-    embed a sortable timestamp, so the newest files are checked first; only
-    their tails are read.
+    window, secondary = weekly) in every token_count event.
+
+    A file's name carries the session *start* time, so it says nothing about
+    which file holds the freshest data — a long-running session started hours
+    ago can be the active one. The newest files by mtime are scanned and the
+    snapshot with the newest event timestamp wins across all of them.
     """
     home = _codex_home() if home is None else home
-    info = _codex_config_defaults(home)
     pattern = os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")
-    files = sorted(glob.glob(pattern), key=os.path.basename, reverse=True)
+    files = sorted(glob.glob(pattern), key=_mtime, reverse=True)
+
+    def fresher(found, best, key):
+        if key not in found:
+            return False
+        if key not in best:
+            return True
+        return found.get(key + "_ts", 0.0) > best.get(key + "_ts", 0.0)
+
+    best = {}
     for path in files[:max_files]:
-        for key, value in _codex_scan_tail(path).items():
-            info.setdefault(key, value)
-        if "rate_limits" in info and "model" in info:
-            break
+        found = _codex_scan_tail(path)
+        if fresher(found, best, "rate_limits"):
+            best["rate_limits"] = found["rate_limits"]
+            best["rate_limits_ts"] = found.get("rate_limits_ts", "")
+        if fresher(found, best, "model"):
+            best["model"] = found["model"]
+            best["effort"] = found.get("effort")
+            best["model_ts"] = found.get("model_ts", "")
+    info = {k: v for k, v in best.items() if not k.endswith("_ts") and v is not None}
+    for key, value in _codex_config_defaults(home).items():
+        info[key] = value  # an explicit choice in config.toml wins
     return info or None
 
 
@@ -338,7 +393,8 @@ def codex_window_left(window, now_ts):
     resets = window.get("resets_at")
     if _is_num(resets) and now_ts >= resets:
         return 100
-    return max(0, min(100, round(100 - window["used_percent"])))
+    # Floor, don't round: 99.6% left must show 99, never a false 100.
+    return max(0, min(100, int(100 - window["used_percent"])))
 
 
 def color_for_remaining(pct):
