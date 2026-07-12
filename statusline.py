@@ -2,6 +2,7 @@
 """Claude Code status line: free-context battery + occupied tokens."""
 
 import glob
+import math
 import os
 import subprocess
 import json
@@ -151,7 +152,9 @@ def fmt_window(size):
 
 
 def _is_num(x):
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+    # NaN/inf would crash int() or poison comparisons downstream.
+    return isinstance(x, (int, float)) and not isinstance(x, bool) \
+        and math.isfinite(x)
 
 
 def _normalize_state(state):
@@ -347,8 +350,9 @@ def latest_codex_info(home=None, max_files=8):
     Codex CLI has no command that prints this. The selected model and
     reasoning effort land in config.toml when chosen explicitly (that wins);
     otherwise they come from the latest turn_context event of the session
-    rollout files, which also record a rate_limits object (primary = 5h
-    window, secondary = weekly) in every token_count event.
+    rollout files, which also record a rate_limits object in every
+    token_count event (which window sits in primary vs secondary varies
+    by CLI version; each window's window_minutes says what it is).
 
     A file's name carries the session *start* time, so it says nothing about
     which file holds the freshest data — a long-running session started hours
@@ -405,19 +409,55 @@ def color_for_remaining(pct):
     return DIM
 
 
+def codex_window_label(window):
+    """Label a rate-limit window by its own duration, or None if unknown.
+
+    Which key a window sits under means nothing: codex-cli 0.144.x moved
+    the weekly window from `secondary` into `primary` and dropped the 5h
+    one. A window without a usable duration gets no label — showing a
+    guessed one could lie about which quota is running out.
+    """
+    if not isinstance(window, dict):
+        return None
+    minutes = window.get("window_minutes")
+    if not _is_num(minutes) or minutes <= 0:
+        return None
+    minutes = int(minutes)
+    if minutes == 300:
+        return "5h"
+    if minutes == 10080:
+        return "week"
+    # Exact single-unit fallbacks: 90 must read "90m", never a rounded "2h".
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
 def codex_quota(rl, now_ts=None):
-    """Render '5h N% · week M%' (remaining quota), or None without data."""
+    """Render '5h N% · week M%' (remaining quota), or None without data.
+
+    Shorter windows come first regardless of which key held them, so the
+    layout is stable across the API reshuffling its primary/secondary slots.
+    """
     if not isinstance(rl, dict):
         return None
     now_ts = time.time() if now_ts is None else now_ts
-    parts = []
-    for label, key in (("5h", "primary"), ("week", "secondary")):
-        left = codex_window_left(rl.get(key), now_ts)
-        if left is not None:
-            parts.append(f"{color_for_remaining(left)}{label} {left}%{RESET}")
-    if not parts:
+    windows = []
+    for key in ("primary", "secondary"):
+        window = rl.get(key)
+        label = codex_window_label(window)
+        left = codex_window_left(window, now_ts)
+        if label is None or left is None:
+            continue
+        windows.append((int(window["window_minutes"]), key, label, left))
+    if not windows:
         return None
-    return f"{DIM} · {RESET}".join(parts)
+    windows.sort(key=lambda w: (w[0], w[1]))
+    return f"{DIM} · {RESET}".join(
+        f"{color_for_remaining(left)}{label} {left}%{RESET}"
+        for _, _, label, left in windows)
 
 
 def codex_segment(info, now_ts=None):

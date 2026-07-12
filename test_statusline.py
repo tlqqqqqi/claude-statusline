@@ -365,6 +365,28 @@ def _rl_line(primary_used=4.0, secondary_used=1.0, resets_at=9_999_999_999,
     })
 
 
+def _rl_line_weekly_only(used=0.0, resets_at=9_999_999_999,
+                         ts="2026-07-12T00:00:00.000Z"):
+    """New payload shape (codex-cli 0.144.x): weekly in primary, no 5h."""
+    import json
+    return json.dumps({
+        "timestamp": ts,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {},
+            "rate_limits": {
+                "primary": {
+                    "used_percent": used,
+                    "window_minutes": 10080,
+                    "resets_at": resets_at,
+                },
+                "secondary": None,
+            },
+        },
+    })
+
+
 def _tc_line(model="gpt-5.6-sol", effort=None):
     import json
     return json.dumps({
@@ -589,8 +611,10 @@ class TestCodexSegment(unittest.TestCase):
 
     def _rl(self, p=4.0, w=1.0):
         return {
-            "primary": {"used_percent": p, "resets_at": self.NOW + 100},
-            "secondary": {"used_percent": w, "resets_at": self.NOW + 100},
+            "primary": {"used_percent": p, "window_minutes": 300,
+                        "resets_at": self.NOW + 100},
+            "secondary": {"used_percent": w, "window_minutes": 10080,
+                          "resets_at": self.NOW + 100},
         }
 
     def test_quota_shows_both_windows_remaining(self):
@@ -598,6 +622,54 @@ class TestCodexSegment(unittest.TestCase):
         self.assertIn("5h 96%", seg)
         self.assertIn("week 99%", seg)
         self.assertNotIn("cdx", seg)
+
+    def test_quota_weekly_alone_in_primary_labeled_week(self):
+        # codex-cli 0.144.x: the weekly window moved into `primary` and the
+        # 5h window vanished (`secondary: null`). Label must follow the
+        # window's duration, not which key it sits under.
+        rl = {"primary": {"used_percent": 0.0, "window_minutes": 10080,
+                          "resets_at": self.NOW + 100},
+              "secondary": None}
+        seg = s.codex_quota(rl, now_ts=self.NOW)
+        self.assertIn("week 100%", seg)
+        self.assertNotIn("5h", seg)
+
+    def test_quota_swapped_keys_keep_labels_and_short_window_first(self):
+        rl = {"primary": {"used_percent": 9.0, "window_minutes": 10080,
+                          "resets_at": self.NOW + 100},
+              "secondary": {"used_percent": 30.0, "window_minutes": 300,
+                            "resets_at": self.NOW + 100}}
+        seg = s.codex_quota(rl, now_ts=self.NOW)
+        self.assertIn("5h 70%", seg)
+        self.assertIn("week 91%", seg)
+        self.assertLess(seg.index("5h"), seg.index("week"))
+
+    def test_quota_unknown_durations_formatted_exactly(self):
+        for minutes, label in ((45, "45m"), (90, "90m"), (360, "6h"),
+                               (4320, "3d")):
+            rl = {"primary": {"used_percent": 50.0, "window_minutes": minutes,
+                              "resets_at": self.NOW + 100}}
+            self.assertIn(f"{label} 50%", s.codex_quota(rl, now_ts=self.NOW))
+
+    def test_quota_window_without_duration_is_skipped(self):
+        # No window_minutes -> no honest label; a guessed one could lie.
+        rl = {"primary": {"used_percent": 5.0, "resets_at": self.NOW + 100},
+              "secondary": {"used_percent": 1.0, "window_minutes": 10080,
+                            "resets_at": self.NOW + 100}}
+        seg = s.codex_quota(rl, now_ts=self.NOW)
+        self.assertIn("week 99%", seg)
+        self.assertNotIn("5h", seg)
+        self.assertIsNone(s.codex_quota(
+            {"primary": {"used_percent": 5.0, "resets_at": self.NOW + 100}},
+            now_ts=self.NOW))
+
+    def test_quota_nonfinite_numbers_are_skipped_not_crash(self):
+        nan = float("nan")
+        rl = {"primary": {"used_percent": nan, "window_minutes": 300,
+                          "resets_at": self.NOW + 100},
+              "secondary": {"used_percent": 1.0, "window_minutes": nan,
+                            "resets_at": self.NOW + 100}}
+        self.assertIsNone(s.codex_quota(rl, now_ts=self.NOW))
 
     def test_quota_none_when_no_snapshot(self):
         self.assertIsNone(s.codex_quota(None, now_ts=self.NOW))
@@ -679,6 +751,19 @@ class TestRenderCodex(unittest.TestCase):
                 self.assertNotIn("cdx", lines[2])
                 self.assertIn("5h 96%", lines[2])
                 self.assertIn("week 99%", lines[2])
+            finally:
+                self._restore(old)
+
+    def test_codex_line_weekly_only_shape(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T02-00-00-y.jsonl",
+                           [_tc_line(model="gpt-5.6-sol"),
+                            _rl_line_weekly_only(used=0.0)])
+            old = self._with_codex_home(home)
+            try:
+                line3 = s.render(self._data()).split("\n")[2]
+                self.assertIn("week 100%", line3)
+                self.assertNotIn("5h", line3)
             finally:
                 self._restore(old)
 
