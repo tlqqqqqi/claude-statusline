@@ -1,6 +1,21 @@
 import unittest
 import statusline as s
 import os
+import tempfile as _tempfile
+
+_CFG = _tempfile.TemporaryDirectory()
+_real_spawn_codex_refresh = s.spawn_codex_refresh
+
+
+def setUpModule():
+    # render() must neither read the real live-limits cache nor boot a real
+    # `codex app-server` in the background.
+    os.environ["CLAUDE_CONFIG_DIR"] = _CFG.name
+    s.spawn_codex_refresh = lambda *a, **k: None
+
+
+def tearDownModule():
+    s.spawn_codex_refresh = _real_spawn_codex_refresh
 
 
 class TestFmtTokens(unittest.TestCase):
@@ -403,6 +418,112 @@ def _tc_line(model="gpt-5.6-sol", effort=None):
     })
 
 
+def _rl_line_no_windows(ts="2026-07-12T05:00:00.000Z"):
+    """Logged by a turn rejected for hitting the usage limit."""
+    import json
+    return json.dumps({
+        "timestamp": ts,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": None,
+            "rate_limits": {"limit_id": "premium", "primary": None,
+                            "secondary": None},
+        },
+    })
+
+
+class TestCodexLive(unittest.TestCase):
+    TS = 1_783_814_400  # 2026-07-12T00:00:00Z, the _rl_line default
+
+    def _live(self, fetched_at, used=100.0):
+        return {"fetched_at": fetched_at,
+                "rate_limits": {"primary": {"used_percent": used,
+                                            "window_minutes": 300,
+                                            "resets_at": 9_999_999_999}}}
+
+    def test_windowless_snapshot_does_not_shadow_real_one(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_rl_line(primary_used=7.0), _rl_line_no_windows()])
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 7.0)
+
+    def test_newer_windowless_file_does_not_shadow_older_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            old = _write_rollout(home, "11", "rollout-2026-07-11T10-00-00-a.jsonl",
+                                 [_rl_line(primary_used=7.0)])
+            new = _write_rollout(home, "12", "rollout-2026-07-12T05-00-00-b.jsonl",
+                                 [_rl_line_no_windows()])
+            os.utime(old, (1_000_000_100, 1_000_000_100))
+            os.utime(new, (1_000_000_200, 1_000_000_200))
+            info = s.latest_codex_info(home)
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 7.0)
+
+    def test_fresher_live_snapshot_wins(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_rl_line(primary_used=7.0)])
+            info = s.latest_codex_info(home, live=self._live(self.TS + 60))
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 100.0)
+
+    def test_older_live_snapshot_loses(self):
+        with tempfile.TemporaryDirectory() as home:
+            _write_rollout(home, "12", "rollout-2026-07-12T01-00-00-x.jsonl",
+                           [_rl_line(primary_used=7.0)])
+            info = s.latest_codex_info(home, live=self._live(self.TS - 60))
+            self.assertEqual(info["rate_limits"]["primary"]["used_percent"], 7.0)
+
+    def test_live_ignored_when_codex_unused(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertIsNone(s.latest_codex_info(home, live=self._live(self.TS)))
+
+    def test_live_window_converted_to_rollout_shape(self):
+        self.assertEqual(
+            s._live_window({"usedPercent": 16, "windowDurationMins": 10080,
+                            "resetsAt": 5}),
+            {"used_percent": 16, "window_minutes": 10080, "resets_at": 5})
+        self.assertIsNone(s._live_window(None))
+
+    def test_load_live_rejects_missing_or_malformed(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "live.json")
+            self.assertIsNone(s.load_codex_live(path))
+            for bad in ({"rate_limits": self._live(1)["rate_limits"]},
+                        {"fetched_at": 1, "rate_limits": {"primary": None}},
+                        []):
+                with open(path, "w") as f:
+                    json.dump(bad, f)
+                self.assertIsNone(s.load_codex_live(path))
+            with open(path, "w") as f:
+                json.dump(self._live(1), f)
+            self.assertEqual(s.load_codex_live(path)["fetched_at"], 1)
+
+    def _spawn_calls(self, home, d, now_ts):
+        from unittest import mock
+        with mock.patch("shutil.which", return_value="/bin/codex"), \
+                mock.patch("subprocess.Popen") as popen:
+            _real_spawn_codex_refresh(os.path.join(d, "live.json"),
+                                      now_ts=now_ts, home=home)
+        return popen.call_count
+
+    def test_spawn_throttled_by_attempt_marker(self):
+        import time
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(home, "sessions"))
+            now = time.time()
+            self.assertEqual(self._spawn_calls(home, d, now), 1)
+            self.assertEqual(self._spawn_calls(home, d, now + 1), 0)
+            self.assertEqual(self._spawn_calls(home, d, now + s.CODEX_LIVE_TTL + 1), 1)
+
+    def test_no_spawn_without_codex_sessions(self):
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self._spawn_calls(home, d, 1e12), 0)
+
+
 class TestCodexWindowLeft(unittest.TestCase):
     NOW = 1_783_800_000
 
@@ -684,29 +805,27 @@ class TestCodexSegment(unittest.TestCase):
         self.assertNotIn(s.YELLOW, s.codex_quota(self._rl(), now_ts=self.NOW))
         self.assertNotIn(s.RED, s.codex_quota(self._rl(), now_ts=self.NOW))
 
-    def test_segment_model_effort_and_quota(self):
+    def test_segment_labelled_codex_not_model(self):
         info = {"model": "gpt-5.6-sol", "effort": "high",
                 "rate_limits": self._rl()}
         seg = s.codex_segment(info, now_ts=self.NOW)
-        self.assertIn("[gpt-5.6-sol · high]", seg)
+        self.assertIn("[codex · high]", seg)
+        self.assertNotIn("gpt-5.6-sol", seg)
         self.assertIn("5h 96%", seg)
 
-    def test_segment_model_brackets_are_dim(self):
+    def test_segment_label_is_dim(self):
         seg = s.codex_segment({"model": "gpt-5.6-sol"}, now_ts=self.NOW)
-        self.assertIn(f"{s.DIM}[gpt-5.6-sol]{s.RESET}", seg)
+        self.assertEqual(seg, f"{s.DIM}[codex]{s.RESET}")
 
     def test_segment_no_effort_when_absent(self):
         seg = s.codex_segment({"model": "gpt-5.6-sol", "effort": None,
                                "rate_limits": self._rl()}, now_ts=self.NOW)
-        self.assertIn("[gpt-5.6-sol]", seg)
-        self.assertNotIn("·", seg.split("]")[0])
+        self.assertIn("[codex]", seg)
 
-    def test_segment_quota_only_without_model(self):
-        import re
+    def test_segment_quota_only_still_labelled(self):
         seg = s.codex_segment({"rate_limits": self._rl()}, now_ts=self.NOW)
+        self.assertIn("[codex]", seg)
         self.assertIn("5h 96%", seg)
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", seg)  # drop ANSI codes
-        self.assertNotIn("[", plain)
 
     def test_segment_none_when_empty(self):
         self.assertIsNone(s.codex_segment(None, now_ts=self.NOW))
@@ -747,8 +866,8 @@ class TestRenderCodex(unittest.TestCase):
                 lines = s.render(self._data()).split("\n")
                 self.assertEqual(len(lines), 3)
                 self.assertNotIn("5h", lines[1])
-                self.assertIn("[gpt-5.6-sol]", lines[2])
-                self.assertNotIn("cdx", lines[2])
+                self.assertIn("[codex]", lines[2])
+                self.assertNotIn("gpt-5.6-sol", lines[2])
                 self.assertIn("5h 96%", lines[2])
                 self.assertIn("week 99%", lines[2])
             finally:

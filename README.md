@@ -1,18 +1,18 @@
 # claude-statusline
 
-A three-line [Claude Code](https://code.claude.com) status line: a **battery bar of free context** plus the **occupied context in tokens**, color-coded by absolute thresholds, and a **Codex line** with the selected model and remaining quota. Nerd Font glyphs, no external dependencies (Python 3 stdlib only — no `jq`).
+A three-line [Claude Code](https://code.claude.com) status line: a **battery bar of free context** plus the **occupied context in tokens**, color-coded by absolute thresholds, and a **Codex line** with the reasoning effort and remaining quota. Nerd Font glyphs, no external dependencies (Python 3 stdlib only — no `jq`).
 
 ```
 [Opus 4.8 (1M) · high]   ContextPlugin  │   feature/auth
 ▰▰▰▰▰▰▰▰▱▱ 81%  │   187k  │  $0.08 · $5.55 (day)  │   7m 3s
-[gpt-5.6-sol · high]  5h 93% · week 99%
+[codex · high]  5h 93% · week 99%
 ```
 
 **Line 1** — model + context window size + reasoning effort (`effort.level`; omitted when the model doesn't support it), current folder (real basename), and git branch (only inside a repo; `*` when dirty).
 
 **Line 2** — battery bar of *free* context (`remaining_percentage`), occupied tokens (`total_input_tokens`), cost (`$session · $today (day)`), and session duration.
 
-**Line 3** — [Codex](https://github.com/openai/codex): selected model + reasoning effort (dim, in brackets) and remaining quota. Omitted entirely when Codex isn't installed.
+**Line 3** — [Codex](https://github.com/openai/codex): `codex` + reasoning effort (dim, in brackets) and remaining quota. Omitted entirely when Codex isn't installed.
 
 ### Color thresholds
 
@@ -49,27 +49,35 @@ re-count money already spent.
 
 ### Codex line
 
-`[gpt-5.6-sol · high]  5h 93% · week 99%` is the state of your OpenAI
-**Codex** install: the currently selected model and reasoning effort, then
-how much of the rate limit is still *unused* — the 5-hour window and the
-weekly window. Codex CLI has no command that prints this, so the script
-reads its files directly (no network calls, no quota spent):
+`[codex · high]  5h 93% · week 99%` is the state of your OpenAI
+**Codex** install: the selected reasoning effort, then how much of the rate
+limit is still *unused* — the 5-hour window and the weekly window. Codex CLI
+has no command that prints this, so the script reads it from two places (no
+quota spent):
 
-- **Model + effort** come from the top-level `model` /
+- **Effort** (and the model, which is not shown) come from the top-level `model` /
   `model_reasoning_effort` keys of `$CODEX_HOME/config.toml` — that's where
   an explicit selection (e.g. via `/model` in the TUI) lands. When unset
   there, they fall back to the latest `turn_context` event of the session
   rollout files under `$CODEX_HOME/sessions/`; effort is omitted while Codex
   leaves it null (the model's default).
-- **Quota** comes from the `rate_limits` snapshot (used percent + reset time
+- **Quota, live**: at most once a minute the status line starts a detached
+  background process that asks `codex app-server` for
+  `account/rateLimits/read` (what the Codex app itself polls) and caches the
+  answer in `~/.claude/statusline_codex_limits.json`. Renders only read that
+  cache, so the status line never waits on it. This only happens when
+  `codex` is on `PATH` and `$CODEX_HOME/sessions/` exists.
+- **Quota, fallback**: the `rate_limits` snapshot (used percent + reset time
   per window) that every `token_count` event of the rollout files records.
-  Only the tails of the newest files are read.
+  Only the tails of the newest files are read. Snapshots without any window
+  (a turn rejected at the usage limit logs one) are skipped.
 
-Each quota window is colored by what's left: dim above 25%, yellow at 25%
-and below, red at 10% and below. A snapshot only updates while Codex is
-actually running, so it can be stale; once a window's recorded reset time
-has passed, the script shows 100% for it. The line is omitted entirely when
-there is no Codex install or nothing to read. (`$CODEX_HOME` defaults to
+Whichever of the two is newer wins. Each quota window is colored by what's
+left: dim above 25%, yellow at 25% and below, red at 10% and below. Rollout
+snapshots only update while Codex is actually running, so without the live
+cache they can be stale; once a window's recorded reset time has passed, the
+script shows 100% for it. The line is omitted entirely when there is no Codex
+install or nothing to read. (`$CODEX_HOME` defaults to
 `~/.codex`.)
 
 ## Install

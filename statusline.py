@@ -5,6 +5,7 @@ import glob
 import math
 import os
 import subprocess
+import sys
 import json
 import tempfile
 import time
@@ -106,7 +107,8 @@ def render(data):
 
     out = line1 + "\n" + line2
     try:
-        codex = codex_segment(latest_codex_info())
+        spawn_codex_refresh()
+        codex = codex_segment(latest_codex_info(live=load_codex_live()))
     except Exception:
         codex = None  # never let the Codex extras take the status line down
     if codex:
@@ -115,8 +117,9 @@ def render(data):
 
 
 def main():
-    import sys
-    import json
+    if sys.argv[1:2] == ["--refresh-codex"]:
+        refresh_codex_live(sys.argv[2] if len(sys.argv) > 2 else None)
+        return
     try:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -253,6 +256,17 @@ def _event_ts(ts):
         return 0.0
 
 
+def _has_window(rl):
+    """True if a rate_limits snapshot carries at least one window.
+
+    A turn rejected for hitting the usage limit still logs a snapshot, but
+    under another limit_id ("premium") with both windows null. Taken as the
+    freshest, it would blank the quota exactly when it matters most.
+    """
+    return isinstance(rl, dict) and any(
+        isinstance(rl.get(key), dict) for key in ("primary", "secondary"))
+
+
 def _codex_scan_tail(path, tail_bytes=262144):
     """Latest rate_limits / model / effort found in a rollout file's tail.
 
@@ -285,7 +299,7 @@ def _codex_scan_tail(path, tail_bytes=262144):
         if not isinstance(payload, dict):
             continue
         ts = _event_ts(event.get("timestamp"))
-        if want_rl and isinstance(payload.get("rate_limits"), dict):
+        if want_rl and _has_window(payload.get("rate_limits")):
             found["rate_limits"] = payload["rate_limits"]
             found["rate_limits_ts"] = ts
         if want_tc and event.get("type") == "turn_context" \
@@ -344,7 +358,127 @@ def _codex_config_defaults(home):
     return {k: v for k, v in out.items() if v}
 
 
-def latest_codex_info(home=None, max_files=8):
+CODEX_LIVE_TTL = 60  # seconds between live rate-limit fetches
+
+
+def _codex_live_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "statusline_codex_limits.json")
+
+
+def _live_window(window):
+    """App-server camelCase window -> the rollout's snake_case shape."""
+    if not isinstance(window, dict):
+        return None
+    return {"used_percent": window.get("usedPercent"),
+            "window_minutes": window.get("windowDurationMins"),
+            "resets_at": window.get("resetsAt")}
+
+
+def fetch_codex_live_limits(timeout=20):
+    """Ask `codex app-server` for the account's current rate limits.
+
+    Rollout files only record limits while Codex runs a turn, so they go
+    stale between sessions; the app-server's account/rateLimits/read is
+    what the Codex app itself polls. Takes seconds (it boots the server),
+    so it only ever runs in a detached background process.
+    Returns a rate_limits dict in rollout shape, or None.
+    """
+    import threading
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    watchdog = threading.Timer(timeout, proc.kill)
+    watchdog.start()
+    try:
+        for msg in (
+                {"id": 1, "method": "initialize",
+                 "params": {"clientInfo": {"name": "statusline", "version": "1"}}},
+                {"method": "initialized", "params": {}},
+                {"id": 2, "method": "account/rateLimits/read", "params": {}}):
+            proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+        for line in proc.stdout:
+            try:
+                reply = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(reply, dict) and reply.get("id") == 2:
+                result = reply.get("result")
+                rl = result.get("rateLimits") if isinstance(result, dict) else None
+                if not isinstance(rl, dict):
+                    return None
+                out = {key: _live_window(rl.get(key)) for key in ("primary", "secondary")}
+                return out if _has_window(out) else None
+        return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        watchdog.cancel()
+        proc.kill()
+        proc.wait()
+
+
+def refresh_codex_live(path=None):
+    """Fetch live limits and store them with their fetch time (atomically)."""
+    path = _codex_live_path() if path is None else path
+    rl = fetch_codex_live_limits()
+    if rl is None:
+        return
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".statusline_codex.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({"fetched_at": time.time(), "rate_limits": rl}, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def load_codex_live(path=None):
+    """Cached live snapshot {'fetched_at', 'rate_limits'}, or None."""
+    path = _codex_live_path() if path is None else path
+    data = load_state(path)
+    if not _is_num(data.get("fetched_at")) or not _has_window(data.get("rate_limits")):
+        return None
+    return data
+
+
+def spawn_codex_refresh(path=None, now_ts=None, ttl=CODEX_LIVE_TTL, home=None):
+    """Start a detached live fetch when the cache is older than ttl.
+
+    Only for a Codex home that has sessions: no point booting the server
+    (or showing a Codex line) for someone who doesn't use Codex. The marker is touched before spawning, so renders arriving
+    while a fetch runs (or after one failed) don't pile up more of them:
+    at most one attempt per ttl, success or not.
+    """
+    import shutil
+    path = _codex_live_path() if path is None else path
+    now_ts = time.time() if now_ts is None else now_ts
+    home = _codex_home() if home is None else home
+    marker = path + ".attempt"
+    if now_ts - _mtime(marker) < ttl or not shutil.which("codex") \
+            or not os.path.isdir(os.path.join(home, "sessions")):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(marker, "w"):
+            pass
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--refresh-codex", path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def latest_codex_info(home=None, max_files=8, live=None):
     """Current Codex state (model, effort, rate limits), or None if nothing.
 
     Codex CLI has no command that prints this. The selected model and
@@ -358,6 +492,10 @@ def latest_codex_info(home=None, max_files=8):
     which file holds the freshest data — a long-running session started hours
     ago can be the active one. The newest files by mtime are scanned and the
     snapshot with the newest event timestamp wins across all of them.
+
+    `live` is a load_codex_live() snapshot; it replaces the rollout's
+    rate limits when it was fetched after the newest rollout event. It
+    only applies once rollouts show Codex is in use under this home.
     """
     home = _codex_home() if home is None else home
     pattern = os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")
@@ -380,7 +518,9 @@ def latest_codex_info(home=None, max_files=8):
             best["model"] = found["model"]
             best["effort"] = found.get("effort")
             best["model_ts"] = found.get("model_ts", "")
-    info = {k: v for k, v in best.items() if not k.endswith("_ts") and v is not None}
+    if live and best and live["fetched_at"] > best.get("rate_limits_ts", 0.0):
+        best["rate_limits"] = live["rate_limits"]
+    info ={k: v for k, v in best.items() if not k.endswith("_ts") and v is not None}
     for key, value in _codex_config_defaults(home).items():
         info[key] = value  # an explicit choice in config.toml wins
     return info or None
@@ -461,24 +601,24 @@ def codex_quota(rl, now_ts=None):
 
 
 def codex_segment(info, now_ts=None):
-    """Render the Codex status line: '[model · effort]  cdx 5h N% · wk M%'.
+    """Render the Codex status line: '[codex · effort]  5h N% · week M%'.
 
-    Model and effort come from the latest turn_context (effort is omitted
-    when Codex leaves it null, i.e. the model's default). Returns None when
-    there is nothing to show.
+    Labelled "codex" rather than by model name. Effort comes from config.toml
+    or the latest turn_context (omitted when Codex leaves it null, i.e. the
+    model's default). Returns None when there is nothing to show.
     """
     if not isinstance(info, dict):
         return None
-    parts = []
-    if info.get("model"):
-        head = info["model"]
-        if info.get("effort"):
-            head += f" · {info['effort']}"
-        parts.append(f"{DIM}[{head}]{RESET}")
     quota = codex_quota(info.get("rate_limits"), now_ts)
+    if not (quota or info.get("model") or info.get("effort")):
+        return None
+    head = "codex"
+    if info.get("effort"):
+        head += f" · {info['effort']}"
+    parts = [f"{DIM}[{head}]{RESET}"]
     if quota:
         parts.append(quota)
-    return "  ".join(parts) if parts else None
+    return "  ".join(parts)
 
 
 def daily_total_for(data, now=None):
